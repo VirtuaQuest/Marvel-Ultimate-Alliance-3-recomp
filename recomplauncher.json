@@ -2,7 +2,7 @@
   "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
   "format": 1,
   "name": "MUA3 Recomp",
-  "repo": "VirtuaQuest/Marvel-Ultimate-Alliance-3-recomp",
+  "repo": "Jazzneo/Marvel-Ultimate-Alliance-3-recomp",
   "min": "0.90.0-beta.36",
   "requires": [
     "start",
@@ -58,7 +58,7 @@
     }
   ],
   "prepare": {
-    "program": ["mua3launcher.exe"],
+    "program": ["mua3launcher.exe", "run.sh"],
     "args": [
       "--prepare",
       "--game={input:base}",
@@ -70,7 +70,7 @@
     "timeout": 7200
   },
   "start": {
-    "program": ["mua3launcher.exe"],
+    "program": ["mua3launcher.exe", "play-steam.sh"],
     "args": ["--play"]
   },
   "config": [
@@ -139,7 +139,8 @@
       "help": "Fill the window, or keep the game's 16:9 picture with bars on wider screens.",
       "choices": [
         { "label": "Fill the window", "set": { "aspect": "unlocked" } },
-        { "label": "Original 16:9", "set": { "aspect": "original" } }
+        { "label": "Original 16:9", "set": { "aspect": "original" } },
+        { "label": "Stretch to fill (no bars on a Steam Deck)", "set": { "aspect": "stretch" } }
       ],
       "defaults": { "aspect": "unlocked" }
     },
@@ -236,6 +237,21 @@
         { "label": "By label (Xbox style)", "set": { "bind_pad_a": "south", "bind_pad_b": "east", "bind_pad_x": "west", "bind_pad_y": "north" } }
       ],
       "defaults": { "bind_pad_a": "east", "bind_pad_b": "south", "bind_pad_x": "north", "bind_pad_y": "west" }
+    },
+    {
+      "id": "prompts",
+      "label": "Button icons",
+      "group": "Controls",
+      "help": "Which controller's buttons the game's button icons show. Auto follows the controller you're using.",
+      "choices": [
+        { "label": "Auto", "set": { "prompts": "auto" } },
+        { "label": "Nintendo", "set": { "prompts": "nintendo" } },
+        { "label": "Xbox", "set": { "prompts": "xbox" } },
+        { "label": "PlayStation", "set": { "prompts": "playstation" } },
+        { "label": "Steam Deck", "set": { "prompts": "steamdeck" } },
+        { "label": "Steam Controller", "set": { "prompts": "steamcontroller" } }
+      ],
+      "defaults": { "prompts": "auto" }
     },
     {
       "id": "rumble",

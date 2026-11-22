@@ -18,6 +18,42 @@ No game files are included or ever committed, and the releases hold no game code
 your own copy on your own PC. You need your own legally obtained copy of the game, its 4.0.1 update and the keys from
 your own console.
 
+## Linux / Steam Deck (this fork)
+
+This fork adds a native **Linux and Steam Deck** version of
+[VirtuaQuest's MUA3 Recomp](https://github.com/VirtuaQuest/Marvel-Ultimate-Alliance-3-recomp). Latest: **v8.2**,
+tested on a Steam Deck LCD (SteamOS, RADV).
+
+**What's new in this fork:**
+
+- **Button icons that match your controller.** The game's own A/B/X/Y, L/R/ZL/ZR and +/− icons are redrawn when they
+  load to show the controller you're holding: Nintendo, Xbox, PlayStation, Steam Deck or Steam Controller. They keep
+  the game's look; only the label changes. Choose it in Settings > Controls > **Button icons** (Auto by default; on a
+  Deck in Game Mode, Auto picks the Steam Deck style). Code: `runtime/nvn/mua3_prompts.c`.
+- **Faster on the Steam Deck.** Heavy fights went from about 15–20 fps to 45–60 fps: the shader translator turns the
+  game's branchy GPU programs into real loops and if-blocks, compute shaders reserve only the memory they need, and the
+  CPU and GPU work side by side.
+- **Smooth movies.** Hardware video decoding (VAAPI), movies read into memory up front, GPU colour conversion, and no
+  more 2-second pauses.
+- **Fixes:** no audio dropouts, no crash on "return to start screen", an on-screen "PRELOADING SHADERS" bar, and a
+  **Fill screen (stretch)** aspect option for the Deck's 16:10 screen.
+- **Steam Deck setup:** `run.sh` sets up a Fedora distrobox with everything needed to build, and `play-steam.sh` is the
+  entry to add to Steam for Game Mode.
+
+**Install (Linux / Steam Deck):**
+
+1. Download `MUA3-Recomp-Linux-SteamDeck-v<version>-public.tar.gz` from
+   [this fork's Releases](https://github.com/Jazzneo/Marvel-Ultimate-Alliance-3-recomp/releases) and extract it
+   somewhere you can write to (on a Deck, for example `~/Applications`).
+2. In Desktop Mode, run `MUA3 Recomp.desktop` (or `./run.sh`). The first start needs internet: it creates the build
+   container and downloads its tools.
+3. On **GAME FILES**, choose your base game, the 4.0.1 update, the Expansion Pass (optional) and your `prod.keys`, then
+   **INSTALL**.
+4. For Game Mode, add `play-steam.sh` to Steam as a non-Steam game.
+
+Logs (`lasrecomp.log`, `game-mode.log`) go to the game folder. Setup details and the Deck's options are in
+[STEAMOS.md](STEAMOS.md). The Windows instructions below are unchanged from the original project.
+
 ## Play with RecompLauncher
 
 MUA3 Recomp works with [RecompLauncher](https://recomplauncher.com): install it from the launcher, then give Easy Setup

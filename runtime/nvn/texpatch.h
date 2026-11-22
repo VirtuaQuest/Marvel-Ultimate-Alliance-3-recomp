@@ -39,6 +39,10 @@ uint32_t texpatch_generation(void);
 // (rows of 4x4 blocks, `row` bytes apart; RGBA8 rows for uncompressed). No-op for the Nintendo look. Only the
 // tunic and Link's skin (Cosmetics tab colours) change levels other than 0.
 void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h, uint32_t row);
+// A buffer -> texture copy's data (linear blocks / texels, `row` bytes per block row) for level 0 of a whole w x h
+// texture of `bpb`-byte, bw x bh blocks: MUA3's button icons are recognised and restyled in place (the copy's own
+// staging data). True if it was one.
+bool texpatch_copy_in(uint8_t *lin, uint32_t w, uint32_t h, uint32_t row, uint32_t bpb, uint32_t bw, uint32_t bh);
 // Known texture `id` is a heart of the HUD / file select (full, empty, frame, life-up flash): 1, else 0.
 int texpatch_heart_kind(int id);
 // The per-draw tint (renderer `ltint`) for a heart draw (`kind` = texpatch_heart_kind) in the Cosmetics tab's heart colour;

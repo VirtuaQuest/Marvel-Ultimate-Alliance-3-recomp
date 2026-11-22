@@ -100,6 +100,7 @@ typedef struct {
     uint32_t wav_bytes;
     pthread_t thread;
     volatile bool quit;  // reboot (audio_reset)
+    bool joined;         // (audio_stop_threads: the thread has ended)
 } Renderer;
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -883,7 +884,7 @@ static void *renderer_tick(void *arg) {
     uint32_t N = r->sample_count > 4096 ? 4096 : r->sample_count;
     int frame_bytes = (int)(N * 2 * sizeof(float));
     uint64_t next = 0;
-    struct timespec now;
+    const uint64_t period_ns = (uint64_t)N * 1000000000ull / r->sample_rate;
     int target = 4 * frame_bytes;  // queued audio to keep ahead of the device: >= 2 device periods
     if (r->stream) {
         SDL_AudioSpec dev;
@@ -895,24 +896,49 @@ static void *renderer_tick(void *arg) {
                 target / (2 * (int)sizeof(float)));
         }
     }
+    // The device consumes larger blocks than the guest's 5 ms DSP frame. Queue
+    // silence once for scheduling headroom, then run each DSP frame on its own
+    // deadline. Filling a whole device block in a burst coalesces the guest's
+    // update events and starves its software effects and streaming voices.
+    if (r->stream) {
+        memset(out, 0, sizeof out);
+        for (int bytes = 0; bytes < target; bytes += frame_bytes)
+            SDL_PutAudioStreamData(r->stream, out, frame_bytes);
+        SDL_ResumeAudioStreamDevice(r->stream);
+        LOG("[audren] paced DSP updates: %.2f ms; backend %s\n", period_ns / 1e6,
+            SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "unknown");
+    }
     uint64_t klock_ns = 0;  // (the last block's wait for the kernel lock to signal the game: the dropout log)
     int signal_late = 0, late_max = (int)(20000000ull * r->sample_rate / 1000000000ull / (N ? N : 1));  // (~20 ms of blocks)
     if (late_max < 2) late_max = 2;
     while (!r->quit) {
         uint64_t t_wait = plat_now_ns();
+        uint64_t t = plat_now_ns();
+        if (!next) next = t;
+        // Behind the device (stalls: each one used to cost its time of the queue for good, until it played dry every
+        // block, ~15 dropouts a second during a movie on a Steam Deck): the next block now, until the queue is back
+        // above half its target.
+        if (r->stream && SDL_GetAudioStreamQueued(r->stream) < target / 2) next = t;
+        while (t < next && !r->quit) {
+            uint64_t remaining = next - t;
+            struct timespec ts = {(time_t)(remaining / 1000000000ull), (long)(remaining % 1000000000ull)};
+            nanosleep(&ts, NULL);
+            t = plat_now_ns();
+        }
+        if (r->quit) break;
+        // After a stall, give the guest a full interval to service each event
+        // instead of executing several DSP frames back to back.
+        if (t > next + period_ns) next = t;
+        next += period_ns;
         if (r->stream) {
             while (SDL_GetAudioStreamQueued(r->stream) >= target && !r->quit) {
                 struct timespec ts = {0, 1000000};
                 nanosleep(&ts, NULL);
             }
-        } else {
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            uint64_t t = now.tv_sec * 1000000000ull + now.tv_nsec;
-            if (!next) next = t;
-            if (next > t) { struct timespec ts = {0, (long)(next - t)}; nanosleep(&ts, NULL); }
-            next += (uint64_t)N * 1000000000ull / r->sample_rate;
         }
+        if (r->quit) break;
         uint64_t t_lock = plat_now_ns();
+        if (t_lock >= next) next = t_lock + period_ns;
         pthread_mutex_lock(&r->lock);
         uint64_t t_render = plat_now_ns();
         if (r->state == 0) {
@@ -1281,11 +1307,12 @@ static void renderer_open_output(Renderer *r) {
     }
     if (getenv("LARECOMP_NO_AUDIO") && strcmp(getenv("LARECOMP_NO_AUDIO"), "0")) return;
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return; }
+    // A smaller device period reduces dialogue latency; respect an explicit user hint.
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
     SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, (int)r->sample_rate};
     r->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (!r->stream) { LOG("[audren] SDL audio open failed: %s\n", SDL_GetError()); return; }
     if (getenv("LARECOMP_AUDIO_GAIN")) SDL_SetAudioStreamGain(r->stream, (float)atof(getenv("LARECOMP_AUDIO_GAIN")));
-    SDL_ResumeAudioStreamDevice(r->stream);
 }
 
 static void audio_renderer(Service *s, IpcReq *req, IpcResp *resp) {
@@ -1403,6 +1430,7 @@ typedef struct AudioOut {
     pthread_mutex_t lock;
     pthread_t thread;
     volatile bool quit;  // reboot (audio_reset)
+    bool joined;         // (audio_stop_threads: the thread has ended)
 } AudioOut;
 
 // Every renderer / audio out of this boot: a reboot stops their threads (they read guest memory and signal this
@@ -1421,7 +1449,7 @@ static void audio_track(Renderer *r, AudioOut *a) {
 
 static void audout_free(AudioOut *a) {
     a->quit = true;
-    pthread_join(a->thread, NULL);
+    if (!a->joined) pthread_join(a->thread, NULL);
     if (a->stream) SDL_DestroyAudioStream(a->stream);
     if (a->wav) fclose(a->wav);
     free(a);
@@ -1441,13 +1469,29 @@ static void audout_close(Service *s) {
     LOG("[audout] closed\n");
 }
 
+// The first step of a reboot's teardown (runtime/main.c), before the renderer's: the renderer threads read wave
+// buffers in guest memory, and the renderer's reset unmaps the guest heap's driver mapping (a Steam Deck: signal 11 in
+// render_frame on "back to the start screen"). Stops every thread; audio_reset frees the rest later.
+void audio_stop_threads(void) {
+    pthread_mutex_lock(&g_track_lock);
+    for (int i = 0; i < 8; i++) {
+        if (g_rens[i]) g_rens[i]->quit = true;
+        if (g_outs[i]) g_outs[i]->quit = true;
+    }
+    for (int i = 0; i < 8; i++) {
+        if (g_rens[i] && !g_rens[i]->joined) { pthread_join(g_rens[i]->thread, NULL); g_rens[i]->joined = true; }
+        if (g_outs[i] && !g_outs[i]->joined) { pthread_join(g_outs[i]->thread, NULL); g_outs[i]->joined = true; }
+    }
+    pthread_mutex_unlock(&g_track_lock);
+}
+
 RT_ON_RESET(audio_reset) {
     int n = 0;
     for (int i = 0; i < 8; i++) {
         Renderer *r = g_rens[i];
         if (r) {
             r->quit = true;
-            pthread_join(r->thread, NULL);
+            if (!r->joined) pthread_join(r->thread, NULL);
             if (r->stream) SDL_DestroyAudioStream(r->stream);
             if (r->wav) { wav_header(r->wav, r->wav_bytes); fclose(r->wav); }
             for (uint32_t m = 0; m < r->nmix; m++) free(r->mix[m].buf);

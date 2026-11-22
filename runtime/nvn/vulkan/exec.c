@@ -25,6 +25,7 @@
 #include "../recolour.h"
 #include "../screen_filter.h"
 #include "../shader_prep.h"
+#include "../compute_limits.h"
 #include "../../settings.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
@@ -5481,7 +5482,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 }
 
 // ================================================================== compute
-typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; uint64_t code; } CsProg;
+typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3], shared_words; uint64_t code; } CsProg;
+
+static uint32_t compute_shared_words(uint32_t bytes) {
+    const char *e = getenv("LARECOMP_VK_SHARED_SIZE");
+    return nvn_compute_shared_words(e && !atoi(e) ? 0 : bytes);
+}
 
 static void build_compute(void *arg) {
     CsProg *cp = arg;
@@ -5500,30 +5506,46 @@ static void build_compute(void *arg) {
         return;
     }
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
-    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
-    VkSpecializationInfo spec = {3, me, 12, cp->local};
+    uint32_t spec_data[4] = {cp->local[0], cp->local[1], cp->local[2], cp->shared_words};
+    VkSpecializationMapEntry me[4] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+    VkSpecializationInfo spec = {4, me, sizeof spec_data, spec_data};
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup32 = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
+        .requiredSubgroupSize = 32};
+    uint64_t invocations = (uint64_t)cp->local[0] * cp->local[1] * cp->local[2];
+    if (g_vk.compute_subgroup32 && invocations <= g_vk.subgroup32_max_invocations)
+        ci.stage.pNext = &subgroup32;
     SLOW_FEEDBACK(ci);
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    if (r != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST && ci.stage.pNext) {
+        LOG("[compute] 32-lane pipeline rejected (%d); retrying with the driver's subgroup size\n", r);
+        ci.stage.pNext = NULL;
+        r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    }
     SLOW_FEEDBACK_HIT();
     atomic_fetch_add(&stat_compiles, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
     build_end(bs);
     if (r != VK_SUCCESS) LOG("[compute] cs %llx: pipeline failed: %d\n", (unsigned long long)cp->code, r);
+    if (cp->si->msl && strstr(cp->si->msl, "shared uint smem["))
+        LOG("[compute] cs %llx: shared memory %u bytes per workgroup%s\n", (unsigned long long)cp->code,
+            cp->shared_words * 4, cp->shared_words * 4 == NVN_COMPUTE_SHARED_MAX ? " (maximum/fallback)" : " (NVN allocation)");
     slow_build(t0, "pipeline cs", cp->code, 0);
 }
 
 static struct CsEnt { uint64_t addr; uint32_t smask; CsProg *cp; } g_cs_tab[256];  // compute programs by code address
                                                                                  // and stencil slots
 
-static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3], uint32_t smask) {
+static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3], uint32_t smask, uint32_t shared_words) {
     uint64_t h = code_hash;
     for (int i = 0; i < 3; i++) { h ^= local[i]; h *= 0x100000001B3ull; }
     if (smask) { h ^= smask; h *= 0x100000001B3ull; }  // (stencil slots: another translation)
+    h ^= shared_words; h *= 0x100000001B3ull;
     return h;
 }
 
@@ -5566,37 +5588,42 @@ static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint6
 static CsProg *compute_program(NvnProgram *np, uint32_t smask) {
     NvnShaderStage *ss = &np->stages[5];
     if (!ss->code_addr) return NULL;
-    struct CsEnt *tab = g_cs_tab;
-    int n = g_cs_n;
-    for (int i = 0; i < n; i++)
-        if (tab[i].addr == ss->code_addr && tab[i].smask == smask) {
-            shader_fp_check(&tab[i].cp->p.fp[0], ss, "cs");  // (keyed by code address: shader_prep.h)
-            return tab[i].cp;
-        }
+    uint32_t shared_bytes = nvn_compute_shared_bytes(ss->control);
+    uint32_t shared_words = compute_shared_words(shared_bytes);
     uint32_t local[3];
     for (int i = 0; i < 3; i++) {
         local[i] = ss->control ? *(const uint32_t *)(ss->control + 0x748 + 4 * i) : 1;
         if (!local[i]) local[i] = 1;
     }
+    struct CsEnt *tab = g_cs_tab;
+    int n = g_cs_n;
+    for (int i = 0; i < n; i++)
+        if (tab[i].addr == ss->code_addr && tab[i].smask == smask && tab[i].cp->shared_words == shared_words &&
+            !memcmp(tab[i].cp->local, local, sizeof local)) {
+            shader_fp_check(&tab[i].cp->p.fp[0], ss, "cs");  // (keyed by code address: shader_prep.h)
+            return tab[i].cp;
+        }
     if (shader_rec_recording()) {
-        ShaderRec rec = {.kind = 'C', .vs = shader_stage_hash(ss), .local = {local[0], local[1], local[2]}, .stencil = smask};
+        ShaderRec rec = {.kind = 'C', .vs = shader_stage_hash(ss), .local = {local[0], local[1], local[2]},
+                         .stencil = smask, .shared_bytes = shared_bytes};
         shader_rec_note(&rec);
     }
     uint64_t ch = shader_stage_hash(ss);
-    CsProg *cp = ch && prep_cs_n ? PREP_GET(prep_cs, cs_content_key(ch, local, smask)) : NULL;  // prepared before the game
+    CsProg *cp = ch && prep_cs_n ? PREP_GET(prep_cs, cs_content_key(ch, local, smask, shared_words)) : NULL;
     if (cp) {
         if (n < 256) { tab[n].addr = ss->code_addr; tab[n].smask = smask; tab[n].cp = cp; g_cs_n = n + 1; }
         shader_fp_check(&cp->p.fp[0], ss, "cs");
         if (cp->si && cp->si->msl) save_glsl(cp->si->msl, ss->code_addr, "cs");  // (LARECOMP_SAVE_MSL, as below)
         return cp;
     }
-    shader_first_visit("compute", ch, 0, cs_content_key(ch, local, smask));
+    shader_first_visit("compute", ch, 0, cs_content_key(ch, local, smask, shared_words));
     shader_code_store(ss, ch);
     cp = calloc(1, sizeof *cp);
     shader_fp_check(&cp->p.fp[0], ss, "cs");  // (takes the fingerprint)
     cp->code = ss->code_addr;  // (for the build logs)
     if (n < 256) { tab[n].addr = ss->code_addr; tab[n].smask = smask; tab[n].cp = cp; g_cs_n = n + 1; }
     memcpy(cp->local, local, sizeof local);
+    cp->shared_words = shared_words;
     if (!translate_compute(cp, (const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, ss->code_addr, smask))
         return cp;
     save_glsl(cp->si->msl, ss->code_addr, "cs");
@@ -5683,11 +5710,13 @@ static void prep_pipeline(void *arg) {
 
 bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlob *fsb) {
     if (r->kind == 'C') {
-        uint64_t ck = cs_content_key(r->vs, r->local, r->stencil);
+        uint32_t shared_words = compute_shared_words(r->shared_bytes);
+        uint64_t ck = cs_content_key(r->vs, r->local, r->stencil, shared_words);
         if (PREP_GET(prep_cs, ck)) return true;
         CsProg *cp = calloc(1, sizeof *cp);
         cp->code = r->vs;  // (prepared: its content hash, for the build logs)
         memcpy(cp->local, r->local, sizeof cp->local);
+        cp->shared_words = shared_words;
         if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, 0, r->stencil)) return false;
         save_glsl(cp->si->msl, r->vs, "prep_cs");  // (named by its content hash)
         PREP_PUT(prep_cs, ck, cp);
@@ -6071,9 +6100,14 @@ static void draw_indirect(CmdRec *r, bool indexed) {
         if (n % 20000 == 0) LOG("[nvn] indirect: %llu draws, %llu with a count\n", (unsigned long long)n, (unsigned long long)nz);
         if (indexed && !g_ind_probe) {
             g_ind_probe = a;
+#ifdef _WIN32
             extern void plat_watch_page(uint64_t addr, bool reads);  // (=2: the game's reads too)
             const char *wi = getenv("LARECOMP_WATCH_INDIRECT");
             if (wi) plat_watch_page((uint64_t)(uintptr_t)a, atoi(wi) == 2);
+#else
+            if (getenv("LARECOMP_WATCH_INDIRECT"))
+                LOG("[nvn] LARECOMP_WATCH_INDIRECT requires the Windows single-step page watcher\n");
+#endif
         }
     }
     static int cpu = -1;
@@ -6822,6 +6856,18 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
             if (out_bpb == fi->bpb) memcpy(dr, sr, out_row);
             else for (uint32_t x = 0; x < wb; x++) { memcpy(dr + x * 4, sr + x * 3, 3); dr[x * 4 + 3] = 255; }
         }
+    // MUA3's button icons arrive this way (runtime/nvn/mua3_prompts.c): restyled in the staging copy. A style change
+    // shows from the game's next copy (its UI loading the icons again).
+    {   static int logc = -1, nc;  // LARECOMP_LOG_PROMPTS=1: every copy's shape (finding the icons if they move)
+        if (logc < 0) logc = getenv("LARECOMP_LOG_PROMPTS") ? 1 : 0;
+        if (logc && nc++ < 400)
+            LOG("[prompts] buf2tex %ux%u fmt %#x bpb %u level %d region %d,%d,%d %dx%dx%d\n", t->width, t->height, t->format,
+                fi->bpb, level, rg[0], rg[1], rg[2], rg[3], rg[4], rg[5]);
+    }
+    if (nz == 1 && level == 0 && !array && !rg[0] && !rg[1] && (uint32_t)rg[3] == t->width && (uint32_t)rg[4] == t->height) {
+        extern bool texpatch_copy_in(uint8_t *lin, uint32_t w, uint32_t h, uint32_t row, uint32_t bpb, uint32_t bw, uint32_t bh);
+        texpatch_copy_in((uint8_t *)s.ptr, t->width, t->height, (uint32_t)out_row, fi->bpb, fi->bw, fi->bh);
+    }
     VkBufferImageCopy c = {.bufferOffset = s.off, .bufferRowLength = wb * fi->bw, .bufferImageHeight = hb * fi->bh,
                            .imageSubresource = {b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect,
                                                 (uint32_t)level, array ? (uint32_t)rg[2] : 0, array ? nz : 1},

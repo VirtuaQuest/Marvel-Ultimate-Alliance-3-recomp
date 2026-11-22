@@ -16,6 +16,7 @@ extern "C" {
 #include "../input_bind.h"
 #include "../settings.h"
 int input_pad_family(void);              // runtime/hle/input.c
+int input_prompt_style(void);            // runtime/hle/input.c (Steam Deck / Steam Controller too)
 SDL_JoystickID input_active_pad(void);   // runtime/hle/input.c: the controller the game reads (0: none yet)
 void input_apply_background(void);
 }
@@ -281,12 +282,14 @@ extern "C" void controls_tab_draw(float scale) {
     }
     // (LAS Recomp's "Controller light" showed Link's health on the light bar: MUA3 has no health source for it yet)
     {
-        static const char *const fam[] = {"Nintendo", "Xbox", "PlayStation"};
+        static const char *const fam[] = {"Nintendo", "Xbox", "PlayStation", "Steam Deck", "Steam Controller"};
+        int st = input_prompt_style();
         char autol[64];
-        snprintf(autol, sizeof autol, "Auto (%s)", fam[input_pad_family() % 3]);
-        const char *names[] = {autol, "Nintendo", "Xbox", "PlayStation"};
-        opt_choice("Button icons", &g_settings.prompts, names, 4, PROMPTS_AUTO,
-                   "Whose button names MUA3 Recomp's menus show. Auto: the connected controller's.");
+        snprintf(autol, sizeof autol, "Auto (%s)", fam[st >= 0 && st < 5 ? st : 0]);
+        const char *names[N_PROMPTS] = {autol, "Nintendo", "Xbox", "PlayStation", "Steam Deck", "Steam Controller"};
+        opt_choice("Button icons", &g_settings.prompts, names, N_PROMPTS, PROMPTS_AUTO,
+                   "Which controller's buttons the game's button icons and MUA3 Recomp's menus show. "
+                   "Auto: the connected controller's.");
     }
     {
         static const char *const names[] = {"Game layout", "Controller convention"};

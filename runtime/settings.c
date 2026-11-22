@@ -162,7 +162,9 @@ void settings_load(void) {
             continue;
         }
         if (fields != 2) continue;
-        if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
+        if (!strcmp(key, "aspect"))
+            g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL
+                              : !strcmp(val, "stretch") || !strcmp(val, "zoom") ? ASPECT_STRETCH : ASPECT_UNLOCKED;  // (zoom: a test build's, gone)
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "exclusive_fullscreen")) g_settings.exclusive_fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "window_width")) g_settings.window_width = atoi(val);
@@ -198,7 +200,9 @@ void settings_load(void) {
         else if (!strcmp(key, "hide_hero_icon")) g_settings.hide_hero_icon = atoi(val) != 0;
         else if (!strcmp(key, "mirror_mode")) g_settings.mirror_mode = atoi(val) != 0;
         else if (!strcmp(key, "prompts")) g_settings.prompts = !strcmp(val, "nintendo") ? PROMPTS_NINTENDO : !strcmp(val, "xbox") ?
-                                                              PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION : PROMPTS_AUTO;
+                                                              PROMPTS_XBOX : !strcmp(val, "playstation") ? PROMPTS_PLAYSTATION :
+                                                              !strcmp(val, "steamdeck") ? PROMPTS_STEAMDECK :
+                                                              !strcmp(val, "steamcontroller") ? PROMPTS_STEAMCTRL : PROMPTS_AUTO;
         else if (!strcmp(key, "menu_confirm")) g_settings.menu_confirm = !strcmp(val, "game") ? MENU_CONFIRM_GAME
                                                                                                   : MENU_CONFIRM_CONTROLLER;
         else if (!strcmp(key, "language")) {  // ("auto" or one of the game's codes; anything else: auto)
@@ -260,7 +264,8 @@ void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
     fprintf(f, "# MUA3 Recomp settings (the launcher, and the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
-    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
+    fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original"
+                                : g_settings.aspect == ASPECT_STRETCH ? "stretch" : "unlocked");
     fprintf(f, "fullscreen = %d\n",
             g_fullscreen_saved >= 0 && g_settings.fullscreen ? g_fullscreen_saved : g_settings.fullscreen);
     fprintf(f, "exclusive_fullscreen = %d\n", g_settings.exclusive_fullscreen);
@@ -282,8 +287,8 @@ void settings_save(void) {
     fprintf(f, "background_input = %d\n", g_settings.bg_input);
     fprintf(f, "move_360 = %d\nblur_removal = %d\nhide_hero_icon = %d\n", g_settings.move_360, g_settings.blur_removal,
             g_settings.hide_hero_icon);
-    static const char *const prompts[] = {"auto", "nintendo", "xbox", "playstation"};
-    fprintf(f, "prompts = %s\n", prompts[g_settings.prompts & 3]);
+    static const char *const prompts[N_PROMPTS] = {"auto", "nintendo", "xbox", "playstation", "steamdeck", "steamcontroller"};
+    fprintf(f, "prompts = %s\n", prompts[g_settings.prompts >= 0 && g_settings.prompts < N_PROMPTS ? g_settings.prompts : 0]);
     fprintf(f, "menu_confirm = %s\n", g_settings.menu_confirm == MENU_CONFIRM_CONTROLLER ? "controller" : "game");
     fprintf(f, "mirror_mode = %d\n", g_settings.mirror_mode);
     fprintf(f, "language = %s\n", g_language_codes[g_settings.language > LANG_AUTO && g_settings.language < N_LANGUAGES

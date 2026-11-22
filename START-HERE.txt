@@ -1,0 +1,39 @@
+MUA3 Recomp - Linux / Steam Deck source package
+
+Start in Desktop Mode by double-clicking MUA3 Recomp.desktop.
+Choose Trust and Launch / Execute if KDE asks. Keep it in this folder.
+You can also run run.sh in a terminal:
+  ./run.sh
+
+Steam Deck / SteamOS:
+First launch opens a setup terminal, creates a Fedora Distrobox named
+mua3recomp-deck, installs build dependencies, then opens the GUI.
+Internet access is needed. A password prompt may appear. Keep the setup
+terminal open. Later launches reuse the prepared container automatically.
+Distrobox and its container engine must already be installed; update SteamOS
+or see the official installation guide linked in STEAMOS.md if missing.
+
+Choose your own game dump, 4.0.1 update and keys on GAME FILES, then INSTALL.
+PLAY becomes available after game setup and compilation finish.
+First-time setup must run through run.sh or run-linux.sh, not the binary directly.
+
+Logs: launcher-start.log for startup; setup-linux.log for container setup;
+prepare.log for game preparation; play.log and lasrecomp.log for game startup.
+See STEAMOS.md for details. The user confirmed game startup on Steam Deck
+with the included black screen workaround. First-use shader builds may pause
+rendering. Broader performance and full-game stability testing is ongoing.
+
+Included: original SDL3/ImGui launcher, Linux runtime with the audio timing
+patch, source, build/setup scripts, third-party source and runtime libraries.
+Excluded: game archives, extracted files, generated game code, mua3game.so,
+keys, saves, user settings, logs and Python environments.
+
+Bazzite/Fedora and other Linux distributions: see STEAMOS.md for development
+packages. The included binaries were built on Fedora; other systems may
+require a local rebuild. SteamOS automatically uses the Fedora container.
+
+Steam Game Mode: finish INSTALL in Desktop Mode, then add play-steam.sh
+to Steam (or change your shortcut Target to it). Set Start In to this folder
+and disable forced Proton compatibility. Starts the installed game directly
+without helper windows. Logs: game-mode.log and lasrecomp.log. Game Mode
+handoff still needs hardware confirmation; see STEAMOS.md.

@@ -408,10 +408,11 @@ static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
     opt_begin("##video", scale);
     opt_section("Display");
-    const char *aspects[] = {"Unlocked", "Original 16:9"};
-    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 2, ASPECT_UNLOCKED,
-               "Unlocked: the picture fills the window, wider or taller. Original 16:9: the game's own framing, "
-               "with bars on wider windows.");
+    const char *aspects[] = {"Unlocked", "Original 16:9", "Fill screen (stretch)"};
+    opt_choice("Aspect ratio", &g_settings.aspect, aspects, 3, ASPECT_UNLOCKED,
+               "Unlocked: the picture fills the window, wider or taller, where the game allows it. Original 16:9: the "
+               "game's own framing, with bars on wider or taller windows. Fill screen (stretch): the 16:9 picture "
+               "stretched to the whole screen, no bars (a 16:10 Steam Deck: a little taller).");
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.fullscreen = fs;

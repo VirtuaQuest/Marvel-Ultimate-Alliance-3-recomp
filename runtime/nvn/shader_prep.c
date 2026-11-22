@@ -69,6 +69,7 @@ void shader_rec_format(const ShaderRec *r, char *out, size_t n) {
     if (r->kind == 'C') {
         PUT("C cs=%016" PRIx64 " l=%u,%u,%u", r->vs, r->local[0], r->local[1], r->local[2]);
         if (r->stencil) PUT(" st=%x", r->stencil);
+        if (r->shared_bytes) PUT(" sm=%u", r->shared_bytes);
         return;
     }
     PUT("G vs=%016" PRIx64 " fs=%016" PRIx64 " f=%x a=", r->vs, r->fs, r->flags);
@@ -128,6 +129,7 @@ bool shader_rec_parse(const char *line, ShaderRec *r) {
             v = *e == ',' ? e + 1 : e;
         }
         if ((v = field(line, "st"))) r->stencil = (uint32_t)strtoul(v, NULL, 16);
+        if ((v = field(line, "sm"))) r->shared_bytes = (uint32_t)strtoul(v, NULL, 10);
         return r->vs != 0;
     }
     if (!(v = field(line, "vs"))) return false;
@@ -745,9 +747,13 @@ static bool prep_run_locked(const char *romfs, void (*progress)(int done, int to
 
 // The boot's preparation, for the window's title (runtime/nvn/vulkan/device.c ui_run): done / total, 0 / 0 when none
 _Atomic int g_shader_prep_done, g_shader_prep_total;
+void backend_loading_frame(int done, int total);  // (vulkan/device.c: a progress bar in the window)
 static void boot_progress(int done, int total) {
     atomic_store(&g_shader_prep_total, total);
     atomic_store(&g_shader_prep_done, done);
+    static double last;
+    double now = ms_now();
+    if (now - last >= 100 || done >= total) { last = now; backend_loading_frame(done, total); }
 }
 void shader_prep_boot(const char *romfs) {
     const char *e = getenv("LARECOMP_SHADER_PREP");  // (on by default: no start screen runs it here; =0 off)

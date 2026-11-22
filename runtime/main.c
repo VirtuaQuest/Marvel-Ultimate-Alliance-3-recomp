@@ -109,6 +109,7 @@ void backend_reset(void);             // renderer: GPU idle, game textures and a
 void backend_guest_memory_reset(void);  // renderer: guest memory was replaced (re-wrap the heap)
 void backend_clear_window(void);      // a black frame while the game is down
 void backend_quit(void);              // quitting: the render thread stopped, the GPU idle, caches kept (before exit())
+void audio_stop_threads(void);        // services/audio.c: no more guest memory reads (before backend_reset)
 
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
     SDL_Event e;
@@ -119,6 +120,7 @@ static void reboot_idle(void) {  // (main thread, while guest threads stop) keep
 static void teardown(void) {
     uint64_t t0 = plat_now_ns();
     kernel_stop_threads(reboot_idle);
+    audio_stop_threads();
     backend_clear_window();
     backend_reset();
     const ResetFn *start = __start_resets, *stop = __stop_resets;
@@ -224,6 +226,18 @@ int main(int argc, char **argv) {
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    // Check a completed setup without needing a display or Vulkan device.
+    // This also resolves the shared library's imports against the native host.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--check-setup")) continue;
+        char why[512];
+        if (!game_version_select(root, why, sizeof why) || !gamelib_load(root, why, sizeof why)) {
+            fprintf(stderr, "Setup check failed: %s\n", why);
+            return 1;
+        }
+        fprintf(stderr, "Setup check passed: game version and native game library loaded.\n");
+        return 0;
+    }
     { extern void achievements_init(void); achievements_init(); }  // (RecompLauncher's; nothing without it)
     for (;;) {  // (no start screen yet: straight into the game, and a reboot boots it again)
         boot(root);

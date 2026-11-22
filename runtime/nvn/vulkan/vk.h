@@ -39,6 +39,8 @@ typedef struct {
     // VK_EXT_vertex_input_dynamic_state (exec.c): the vertex layout is set per draw (vkCmdSetVertexInputEXT), not
     // baked into each pipeline - fewer pipelines. Off: no extension / feature, or LARECOMP_VK_DYN_VERTEX=0.
     bool vids;
+    bool compute_subgroup32;  // supported AMD compute pipelines: prefer a 32-lane subgroup
+    uint32_t subgroup32_max_invocations;
     PFN_vkCmdSetVertexInputEXT set_vertex_input;
     // LARECOMP_VK_GPL_PROBE=1 only (exec.c gpl_probe, measurement): VK_EXT_graphics_pipeline_library enabled
     bool gpl_probe;

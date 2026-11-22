@@ -3,7 +3,7 @@
 #include "cosmetic_colour.h"
 #include <stdbool.h>
 
-enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1 };
+enum { ASPECT_UNLOCKED = 0, ASPECT_ORIGINAL = 1, ASPECT_STRETCH = 2 };  // (stretch: output_scale.c)
 enum { RES_MATCH = 0, /* 1..8 = 1x..8x */ RES_DYNAMIC = 9, RES_Q75 = 10, RES_Q25 = 11, RES_Q50 = 12 };
 // (11 was 67% of the display: larecomp.ini "67%" now loads as RES_Q75)
 enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /* Windows: AMD FSR 1 */ };
@@ -13,7 +13,8 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
-enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3 };
+enum { PROMPTS_AUTO = 0, PROMPTS_NINTENDO = 1, PROMPTS_XBOX = 2, PROMPTS_PLAYSTATION = 3, PROMPTS_STEAMDECK = 4,
+       PROMPTS_STEAMCTRL = 5, N_PROMPTS };
 // Which face button confirms in our own menus (runtime/ui/pad_nav.mm); the game's input is never affected
 enum { MENU_CONFIRM_GAME = 0, MENU_CONFIRM_CONTROLLER = 1 };
 enum { TIMER_POS_LEFT = 0, TIMER_POS_RIGHT = 1 };  // the run timer's corner (bottom left / right)

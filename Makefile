@@ -1,45 +1,45 @@
-# MUA3 Recomp build (Windows: MSYS2 UCRT64 clang + Vulkan, as LAS Recomp's Windows build).
-#   make gen   recompile extracted/exefs (your own game files) into generated/
-#   make -j    build/mua3recomp.exe, the game code library build/mua3game.dll and the launcher build/mua3launcher.exe
-#   make dlls  the MSYS2 runtime DLLs next to them, so they start from Explorer;  make dist: the release (below)
-# From an MSYS2 UCRT64 shell, or Git Bash with: export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
+# MUA3 Recomp Linux build (SteamOS / Steam Deck and desktop Linux).
+#   make setup-linux   create the local generator environment
+#   make gen           recompile extracted/exefs (your own game files) into generated/
+#   make -j            build the native runtime, game library and same SDL/ImGui launcher
 comma := ,
 B        ?= build
 GEN      ?= generated
 CC       := clang
 CXX      := clang++
 IMGUI    := third_party/imgui
-PY       := .venv/Scripts/python.exe
+PY       ?= .venv-linux/bin/python
 
 # The release's version (its zip's name, the log's [info] line). RELEASE=1: the build `make dist` ships (no console
 # window - the log goes to mua3recomp.log next to the exe - no debug info, the original icon, DEPS' LGPL FFmpeg).
 VERSION  := 0.1.2
 RELEASE  ?=
 DEPS     ?=
+PKG_CONFIG ?= pkg-config
+SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl3 2>/dev/null)
+RUNTIME_CFLAGS := $(shell $(PKG_CONFIG) --cflags vulkan shaderc libavformat libavcodec libavutil libswscale 2>/dev/null)
 
-OSFLAGS  := -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS -D_CRT_RAND_S -DWIN32_LEAN_AND_MEAN -DNOMINMAX \
-            $(if $(DEPS),-I$(DEPS)/include)
+OSFLAGS  := -Ithird_party -D_FILE_OFFSET_BITS=64 -D_POSIX_THREAD_SAFE_FUNCTIONS \
+            $(if $(DEPS),-I$(DEPS)/include) $(SDL_CFLAGS) $(RUNTIME_CFLAGS)
 GENARCH  ?= -march=x86-64-v3  # AVX2 + FMA for the lifted FP/SIMD code (simd.h)
-GENFLAGS := -O1 -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime \
+GENFLAGS := -O1 -fPIC -fno-strict-aliasing -Wno-return-type -Wno-unused-label -fvisibility=hidden -Iruntime \
             -D_FILE_OFFSET_BITS=64 $(GENARCH)
 RL_ACH   := third_party/rl_achievements
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn -I$(RL_ACH)/include $(OSFLAGS)
-CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(OSFLAGS)
-LDFLAGS  := -fuse-ld=lld $(if $(DEPS),-L$(DEPS)/lib) -Wl,--stack,16777216 -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
-            $(if $(RELEASE),-Wl$(comma)--subsystem$(comma)windows -Wl$(comma)--strip-debug) \
-            -lvulkan-1 -lws2_32 -lwinmm -lole32 -lshell32 -lcomdlg32 -luuid -lshaderc_shared \
-            -Wl,--error-limit=0 -Wl,--export-all-symbols -Wl,--out-implib,$(B)/mua3recomp.dll.a
+CXXFLAGS := -O2 -g -std=c++17 -DIMGUI_DISABLE_SSE -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(OSFLAGS)
+LDFLAGS  := -fuse-ld=lld $(if $(DEPS),-L$(DEPS)/lib) -Wl,-z,stack-size=16777216 -lSDL3 -lavformat -lavcodec -lavutil -lswscale \
+            -lvulkan -lshaderc_shared -ldl -lm -pthread -Wl,--error-limit=0 -Wl,--export-dynamic
 
-EXE      := $(B)/mua3recomp.exe
-GAMELIB  := $(B)/mua3game.dll
+EXE      := $(B)/mua3recomp
+GAMELIB  := $(B)/mua3game.so
 MODULES  := game sdk glslc
 
 GEN_SRC  := $(strip $(foreach m,$(MODULES),$(wildcard $(GEN)/$(m)/*.c)))
 GEN_OBJ  := $(patsubst $(GEN)/%.c,$(B)/obj/%.o,$(GEN_SRC)) $(B)/obj/tools/gamelib_entry.o
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
-            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/windows.c
+            $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/linux.c
 RT_HDRS  := $(wildcard runtime/*.h runtime/platform/*.h runtime/nvn/*.h runtime/nvn/maxwell/*.h \
-                       runtime/nvn/vulkan/*.h runtime/ui/*.h)
+                       runtime/nvn/vulkan/*.h runtime/ui/*.h third_party/vma/*.h)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 UI_SRC   := $(wildcard runtime/ui/*.mm)
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
@@ -78,12 +78,15 @@ $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h
 	@mkdir -p $(dir $@)
 	@$(CC) $(GENFLAGS) -c $< -o $@
 
-$(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS)
+$(B)/obj/tools/gamelib_entry.o: tools/gamelib_entry.c $(GAMELIB_SRCS) extracted/exefs/main
 	@mkdir -p $(dir $@)
 	$(CC) $(GENFLAGS) -DGAMELIB_ID='"$(GAMELIB_FULL_ID)"' -c $< -o $@
 
-$(GAMELIB): $(GEN_OBJ) | $(EXE)
-	$(CC) -shared -fuse-ld=lld $(B)/mua3recomp.dll.a -o $@.tmp $^ $(B)/mua3recomp.dll.a
+check-game-code:
+	@test -f extracted/exefs/main && test -n "$(GEN_SRC)" || { echo "Game code is missing: run INSTALL or make gen before building the game library."; exit 1; }
+
+$(GAMELIB): $(GEN_OBJ) | $(EXE) check-game-code
+	$(CC) -shared -fPIC -o $@.tmp $^ -Wl,--allow-shlib-undefined
 	mv -f $@.tmp $@
 	echo $(GAMELIB_FULL_ID) > $@.id
 
@@ -121,6 +124,7 @@ $(B)/inc/shader_code_locs.inc: runtime/nvn/shader_code_locs.txt
 $(B)/rt/nvn/shader_prep.o: $(B)/inc/shader_code_locs.inc
 TRANSLATOR_ID := $(shell cat runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h | sha256sum | cut -c1-12)
 $(B)/rt/nvn/shader_prep.o: RTFLAGS += -I$(B)/inc -DSHADER_TRANSLATOR_ID='"$(TRANSLATOR_ID)"'
+$(B)/rt/nvn/shader_prep.o: runtime/nvn/maxwell/translate.c runtime/nvn/maxwell/shader.h
 
 $(B)/imgui/%.o: $(IMGUI)/%.cpp
 	@mkdir -p $(dir $@)
@@ -134,7 +138,7 @@ $(B)/rl/%.o: $(RL_ACH)/%.c
 	$(CC) -O2 -w -DRC_DISABLE_LUA -I$(RL_ACH)/include -I$(RL_ACH)/third_party/rcheevos/include \
 	    -I$(RL_ACH)/third_party/rcheevos/src -I$(RL_ACH)/third_party/cjson $(OSFLAGS) -c $< -o $@
 
-$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(RL_OBJ) $(ICON_RES)
+$(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ) $(RL_OBJ)
 	@mkdir -p $(dir $@)link
 	$(CXX) -o $(dir $@)link/$(notdir $@) $^ $(LDFLAGS)
 	mv -f $(dir $@)link/$(notdir $@) $@
@@ -150,14 +154,14 @@ $(B)/icon_res.o: $(ICON_ICO)
 	windres -i $(B)/icon.rc -o $@
 
 # ---- the launcher (launcher/launcher.cpp): game files and setup, the display / sound settings, the controls, then the game
-LAUNCHER := $(B)/mua3launcher.exe
+LAUNCHER := $(B)/mua3launcher
 LAUNCHER_IMGUI := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.o $(B)/imgui/imgui_widgets.o \
                   $(B)/imgui/imgui_impl_sdl3.o $(B)/imgui/imgui_impl_sdlrenderer3.o
 $(B)/launcher/launcher.o: launcher/launcher.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-$(LAUNCHER): $(B)/launcher/launcher.o $(LAUNCHER_IMGUI) $(ICON_RES) $(if $(ICON_SRC),$(B)/icon.png)
-	$(CXX) -o $@ $(filter %.o,$^) -fuse-ld=lld -mwindows -lSDL3 $(if $(RELEASE),-Wl$(comma)--strip-debug)
+$(LAUNCHER): $(B)/launcher/launcher.o $(LAUNCHER_IMGUI) $(if $(ICON_SRC),$(B)/icon.png)
+	$(CXX) -o $@ $(filter %.o,$^) -lSDL3 -pthread
 launcher: $(LAUNCHER)
 all: $(LAUNCHER)
 
@@ -169,8 +173,12 @@ $(DLL_STAMP): $(wildcard $(EXE) $(LAUNCHER))
 	@echo "runtime DLLs copied into $(B)/"
 	@touch $@
 dlls: $(EXE) $(LAUNCHER)
-	@rm -f $(DLL_STAMP)
-	@$(MAKE) --no-print-directory $(DLL_STAMP)
+	@touch $(DLL_STAMP)
+
+setup-linux:
+	sh tools/setup_python_linux.sh
+	.venv-linux/bin/python -m pip install --disable-pip-version-check --progress-bar off --upgrade pip setuptools wheel
+	.venv-linux/bin/python -m pip install --disable-pip-version-check --progress-bar off --only-binary=:all: -r tools/requirements-linux.txt
 
 # ---- the release: build/dist/MUA3-Recomp-v<VERSION>-Windows-x64.zip, top folder "MUA3 Recomp/", for players and
 # RecompLauncher (recomplauncher.json). It holds no game code and no game files: the launcher's prepare step
@@ -247,4 +255,4 @@ runtime-objs: $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ)
 clean:
 	rm -rf $(B)
 
-.PHONY: all gen runtime-objs clean launcher dlls deps-windows gen-helper dist
+.PHONY: all gen runtime-objs clean launcher dlls setup-linux check-game-code deps-windows gen-helper dist

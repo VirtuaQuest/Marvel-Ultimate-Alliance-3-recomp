@@ -1002,19 +1002,28 @@ void renderer_mark_gpu_owned(NvnTexture *t) {
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
+// Own the immutable copy until the texture is next used. A queued upload already owns its data: passing that
+// allocation on removes a second full-frame copy (8.3 MB for a 1080p RGBA movie frame) on the render thread.
+static void upload_owned(TexBackend *b, void *data, uint32_t w, uint32_t h, uint32_t stride,
+                         bool nv12, uint32_t uv_off) {
+    if (!b) { free(data); return; }
+    pthread_mutex_lock(&pending_lock);
+    free(b->pending_rgba);
+    b->pending_rgba = data;
+    b->pending_w = w; b->pending_h = h; b->pending_stride = stride;
+    b->pending_nv12 = nv12;
+    b->pending_uv_off = uv_off;
+    b->gpu_owned = true;
+    pthread_mutex_unlock(&pending_lock);
+}
+
 // Host-produced texel data (decoded video, any thread): applied on the render thread at the texture's next use.
 static void upload_rgba_now(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {
     TexBackend *b = t->backend;
-    if (!b) return;  // the game binds the texture before decoding into it; first frames may arrive earlier
+    if (!b) return;
     void *copy = malloc((size_t)stride * h);
     memcpy(copy, rgba, (size_t)stride * h);
-    pthread_mutex_lock(&pending_lock);
-    free(b->pending_rgba);
-    b->pending_rgba = copy;
-    b->pending_w = w; b->pending_h = h; b->pending_stride = stride;
-    b->pending_nv12 = false;
-    b->gpu_owned = true;
-    pthread_mutex_unlock(&pending_lock);
+    upload_owned(b, copy, w, h, stride, false, 0);
 }
 
 // Decoded video as NV12 (runtime/hle/movie.c): the planes (half the bytes of RGBA) go to the GPU, which converts them
@@ -1045,9 +1054,10 @@ bool renderer_upload_nv12(NvnTexture *t, const void *nv12, uint32_t w, uint32_t 
     return true;
 }
 void backend_upload_now(NvnTexture *t, int kind, void *data, uint32_t w, uint32_t h, uint32_t stride, uint32_t uv_off) {
-    if (kind == RQ_UPLOAD_RGBA) upload_rgba_now(t, data, w, h, stride);
-    else upload_nv12_now(t, data, w, h, stride, uv_off);
-    free(data);
+    TexBackend *b = t->backend;
+    bool nv12 = kind == RQ_UPLOAD_NV12;
+    if (nv12 && b && !nv12_format_ok(b->format)) { free(data); return; }
+    upload_owned(b, data, w, h, stride, nv12, uv_off);
 }
 static bool upload_nv12_now(NvnTexture *t, const void *nv12, uint32_t w, uint32_t h, uint32_t stride, uint32_t uv_off) {
     TexBackend *b = t->backend;
@@ -1056,14 +1066,7 @@ static bool upload_nv12_now(NvnTexture *t, const void *nv12, uint32_t w, uint32_
     size_t n = (size_t)uv_off + (size_t)stride * (h / 2);
     void *copy = malloc(n);
     memcpy(copy, nv12, n);
-    pthread_mutex_lock(&pending_lock);
-    free(b->pending_rgba);
-    b->pending_rgba = copy;
-    b->pending_w = w; b->pending_h = h; b->pending_stride = stride;
-    b->pending_nv12 = true;
-    b->pending_uv_off = uv_off;
-    b->gpu_owned = true;
-    pthread_mutex_unlock(&pending_lock);
+    upload_owned(b, copy, w, h, stride, true, uv_off);
     return true;
 }
 

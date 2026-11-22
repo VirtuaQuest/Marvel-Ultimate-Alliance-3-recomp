@@ -30,6 +30,7 @@
 #include "../rando.h"  // (no seeds: the stubs)
 #include "../settings.h"
 #include "astc.h"
+#include "mua3_prompts.h"  // (MUA3's own glyphs)
 #include "recolour.h"
 #include "skin_face.h"
 #include "tegra.h"
@@ -42,7 +43,7 @@ enum { K_BC5, K_BC3, K_ASTC4, K_RGBA8, K_BC1 };
 enum { R_A = 1, R_B, R_X, R_Y, R_L, R_R, R_ZL, R_ZR, R_PLUS, R_MINUS, R_HERO, R_SHEET, R_BOTTLE, R_BOTTLE_MODEL, R_FAIRY_MODEL,
        R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_DGN_MAP, R_MAP_MODEL, R_POWER_PIECE_MODEL,
        R_SKIN };
-enum { STYLE_NINTENDO, STYLE_XBOX, STYLE_PS };
+enum { STYLE_NINTENDO, STYLE_XBOX, STYLE_PS, STYLE_DECK, STYLE_STEAMC };  // (= MP_STYLE_*)
 // labels: R_A..R_MINUS = the button that role is on by default; or these
 enum { L_LS = 32, L_RS, L_DUP, L_DDOWN, L_DLEFT, L_DRIGHT, L_OTHER };
 
@@ -288,6 +289,8 @@ int texpatch_identify(const NvnTexture *t) {
             return tu;
         }
     }
+    int mp = mua3p_identify(t);  // MUA3's button icons (runtime/nvn/mua3_prompts.c)
+    if (mp >= 0) return MP_ID_BASE + mp;
     int rc = recolour_identify(t, total);  // (Cosmetics recolours: identified only, runtime/nvn/recolour.c)
     return rc >= 0 ? TEXPATCH_RECOLOUR_BASE + rc : -1;
 }
@@ -299,7 +302,8 @@ static int prompt_style(void) {
     if (env == -2) {
         const char *e = getenv("LARECOMP_PROMPTS");
         env = !e ? -1 : !strcmp(e, "xbox") ? PROMPTS_XBOX : !strcmp(e, "playstation") ? PROMPTS_PLAYSTATION :
-              !strcmp(e, "nintendo") ? PROMPTS_NINTENDO : PROMPTS_AUTO;
+              !strcmp(e, "nintendo") ? PROMPTS_NINTENDO : !strcmp(e, "steamdeck") ? PROMPTS_STEAMDECK :
+              !strcmp(e, "steamcontroller") ? PROMPTS_STEAMCTRL : PROMPTS_AUTO;
         until = getenv("LARECOMP_PROMPTS_UNTIL") ? atol(getenv("LARECOMP_PROMPTS_UNTIL")) : -1;
     }
     extern uint64_t renderer_present_count(void);
@@ -307,9 +311,11 @@ static int prompt_style(void) {
     if (p == PROMPTS_XBOX) return STYLE_XBOX;
     if (p == PROMPTS_PLAYSTATION) return STYLE_PS;
     if (p == PROMPTS_NINTENDO) return STYLE_NINTENDO;
-    extern int input_pad_family(void);  // runtime/hle/input.c: the controller SDL reports
-    int f = input_pad_family();
-    return f == 1 ? STYLE_XBOX : f == 2 ? STYLE_PS : STYLE_NINTENDO;
+    if (p == PROMPTS_STEAMDECK) return STYLE_DECK;
+    if (p == PROMPTS_STEAMCTRL) return STYLE_STEAMC;
+    extern int input_prompt_style(void);  // runtime/hle/input.c: the controller SDL reports (Steam Deck / Controller too)
+    int f = input_prompt_style();
+    return f >= STYLE_NINTENDO && f <= STYLE_STEAMC ? f : STYLE_NINTENDO;
 }
 
 static bool hide_hero(void) {
@@ -360,7 +366,7 @@ static uint32_t tunic_rgb(void);
 
 uint32_t texpatch_generation(void) {  // (a rebind re-uploads the glyphs, like a style change; so does a tunic colour)
     cosmetics_test();
-    return (1 + (uint32_t)prompt_style() + (hide_hero() ? 4 : 0) + (labels_hash() << 3)) ^ tunic_rgb() * 0x9E3779B1u ^
+    return (1 + (uint32_t)prompt_style() + (hide_hero() ? 8 : 0) + (labels_hash() << 4)) ^ tunic_rgb() * 0x9E3779B1u ^
            skin_rgb() * 0x85EBCA6Bu;
 }
 
@@ -1131,6 +1137,15 @@ static void skin_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_
 static const int8_t k_sheet_roles[18] = {R_PLUS, R_MINUS, R_A, R_B, 0, 0, R_L, 0, R_R, 0, R_X, R_Y, R_ZL, R_L, 0, R_R, 0, R_ZR};
 
 void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h, uint32_t row) {
+    if (id >= MP_ID_BASE && id < TEXPATCH_RECOLOUR_BASE) {  // MUA3's button icons
+        int labels[MP_NROLES];
+        for (int i = 0; i < MP_NROLES; i++) {
+            int l = prompt_label(R_A + i);
+            labels[i] = l >= R_A && l <= R_MINUS ? l - R_A : l >= L_LS && l <= L_OTHER ? MP_LS + (l - L_LS) : MP_OTHER;
+        }
+        mua3p_apply(id - MP_ID_BASE, lv, blocks, w, h, row, prompt_style(), labels);
+        return;
+    }
     if (id < 0 || id >= g_nrefs) return;
     const Ref *r = &g_refs[id];
     if (r->role == R_TUNIC || r->role == R_TUNIC_RED || r->role == R_TUNIC_BLUE) {
@@ -1175,6 +1190,14 @@ void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h
     encode_image(r, img, dirty, blocks, row);
     free(img);
     free(dirty);
+}
+
+bool texpatch_copy_in(uint8_t *lin, uint32_t w, uint32_t h, uint32_t row, uint32_t bpb, uint32_t bw, uint32_t bh) {
+    if (bpb != 16 || bw != 4 || bh != 4 || w > 256 || h > 256) return false;
+    int id = mua3p_identify_blocks(lin, w, h, row);
+    if (id < 0) return false;
+    texpatch_apply(MP_ID_BASE + id, 0, lin, w, h, row);
+    return true;
 }
 
 // The Hint Sheet's icon (runtime/hle/hint_sheet.c): the dungeon map's (120 x 120) centred on a bottle-sized canvas

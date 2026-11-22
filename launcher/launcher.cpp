@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -39,6 +40,12 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 #define APP "MUA3 Recomp"
@@ -69,13 +76,24 @@ static ImVec4 mix(ImVec4 a, ImVec4 b, float t) {
 // ================================================================== paths
 static std::string g_exe_dir, g_root;  // (the launcher's folder; the data folder, both ending in a separator)
 
+static std::string native_path(std::string p) {
+#ifndef _WIN32
+    std::replace(p.begin(), p.end(), '\\', '/');
+#endif
+    return p;
+}
+static FILE *open_native(const char *p, const char *mode) { return fopen(native_path(p).c_str(), mode); }
+#define fopen(p, mode) open_native(p, mode)
+
 static bool is_dir(const std::string &p) {
     SDL_PathInfo info;
-    return SDL_GetPathInfo(p.c_str(), &info) && info.type == SDL_PATHTYPE_DIRECTORY;
+    std::string n = native_path(p);
+    return SDL_GetPathInfo(n.c_str(), &info) && info.type == SDL_PATHTYPE_DIRECTORY;
 }
 static bool is_file(const std::string &p) {
     SDL_PathInfo info;
-    return SDL_GetPathInfo(p.c_str(), &info) && info.type == SDL_PATHTYPE_FILE;
+    std::string n = native_path(p);
+    return SDL_GetPathInfo(n.c_str(), &info) && info.type == SDL_PATHTYPE_FILE;
 }
 static std::string full_path(const std::string &p) {
 #ifdef _WIN32
@@ -86,13 +104,13 @@ static std::string full_path(const std::string &p) {
 }
 static void find_paths(void) {
     const char *base = SDL_GetBasePath();  // (ends with a separator)
-    g_exe_dir = base ? base : ".\\";
-    std::string up = g_exe_dir + "..\\";
+    g_exe_dir = base ? base : "./";
+    std::string up = g_exe_dir + "../";
     if (is_dir(g_exe_dir + "extracted") || is_file(g_exe_dir + "Makefile")) g_root = g_exe_dir;
     else if (is_dir(up + "extracted") || is_file(up + "Makefile")) g_root = up;
     else g_root = g_exe_dir;
     g_root = full_path(g_root);  // (build\..\ -> the folder itself)
-    if (!g_root.empty() && g_root.back() != '\\' && g_root.back() != '/') g_root += '\\';
+    if (!g_root.empty() && g_root.back() != '\\' && g_root.back() != '/') g_root += '/';
 }
 
 // The release folder (make dist): the extractor / generator (mua3gen), the compiler (zig) and what the game code is
@@ -129,8 +147,13 @@ static std::string gamelib_full_id(void) {
 }
 static bool gamelib_current(void) {  // mua3game.dll is there and was built for these game files and this release
     std::string want = gamelib_full_id(), have;
-    if (want.empty() || !is_file(g_root + "mua3game.dll")) return false;
-    if (FILE *f = fopen((g_root + "mua3game.dll.id").c_str(), "r")) {
+#ifdef __linux__
+    const char *name = "mua3game.so";
+#else
+    const char *name = "mua3game.dll";
+#endif
+    if (want.empty() || !is_file(g_root + name)) return false;
+    if (FILE *f = fopen((g_root + name + std::string(".id")).c_str(), "r")) {
         char id[256] = {0};
         if (fgets(id, sizeof id, f)) have = id;
         fclose(f);
@@ -527,9 +550,15 @@ static void refresh_status(void) {
         g_status.built = is_file(g_exe_dir + "mua3recomp.exe") && gamelib_current();
         return;
     }
+#ifdef __linux__
+    g_status.venv = is_file(g_root + ".venv-linux/bin/python");
+    g_status.msys = true;  // native dependencies were present when the launcher was built
+    g_status.built = is_file(g_root + "build/mua3recomp") && is_file(g_root + "build/mua3game.so");
+#else
     g_status.venv = is_file(g_root + ".venv\\Scripts\\python.exe");
     g_status.msys = is_file(std::string(p_msys) + "\\usr\\bin\\make.exe") && is_file(std::string(p_msys) + "\\ucrt64\\bin\\clang.exe");
     g_status.built = is_file(g_root + "build\\mua3recomp.exe") && is_file(g_root + "build\\mua3game.dll");
+#endif
 }
 
 // ================================================================== the step runner (child processes, a log)
@@ -658,10 +687,50 @@ static int run_process(const Step &st) {
     return (int)code;
 }
 #else
-static int run_process(const Step &st) { log_line("Running steps is only implemented on Windows: " + st.cmd); return -1; }
+static std::atomic<pid_t> g_active_pid{0};
+static int run_process(const Step &st) {
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { log_line("Could not create a process output pipe."); return -1; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        std::string cwd = native_path(st.cwd), command = native_path(st.cmd);
+        setpgid(0, 0);
+        if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
+        execl("/bin/sh", "sh", "-c", command.c_str(), (char *)NULL);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    if (pid < 0) { close(pipefd[0]); log_line("Could not start the requested step."); return -1; }
+    g_active_pid = pid;
+    std::string part;
+    char buf[4096];
+    for (;;) {
+        ssize_t n = read(pipefd[0], buf, sizeof buf);
+        if (n > 0) {
+            part.append(buf, (size_t)n);
+            size_t p;
+            while ((p = part.find_first_of("\r\n")) != std::string::npos) {
+                if (p) log_line(part.substr(0, p));
+                part.erase(0, p + 1);
+            }
+            if (g_cancel) kill(-pid, SIGTERM);
+        } else if (n == 0) break;
+        else if (errno != EINTR) break;
+    }
+    close(pipefd[0]);
+    if (!part.empty()) log_line(part);
+    int status = 1;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    g_active_pid = 0;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+}
 #endif
 
-static std::string q(const std::string &s) { return "\"" + s + "\""; }
+static std::string q(const std::string &s) { return "\"" + native_path(s) + "\""; }
 
 #ifdef _WIN32
 // The release's build of the game code library: generated\{game,sdk,glslc}\*.c compiled by the bundled zig, as many
@@ -919,12 +988,35 @@ static void release_steps(bool extract, bool recompile, bool build) {
 static void start_steps(bool extract, bool recompile, bool build) {
     if (g_running) return;
     if (g_worker.joinable()) g_worker.join();
+    if (!g_cli) {
+        if (g_cli_log) fclose(g_cli_log);
+        g_cli_log = fopen((g_root + "prepare.log").c_str(), "w");
+    }
     g_steps.clear();
     g_cancel = false;
     g_result = 0;
     if (g_release) {
         release_steps(extract, recompile, build);
     } else {
+#ifdef __linux__
+        const std::string py = ".venv-linux/bin/python";
+        if (build) g_steps.push_back({"Check native development packages", "sh tools/build_linux.sh --check", g_root, false});
+        g_steps.push_back({"Python 3.12 environment", "sh tools/setup_python_linux.sh", g_root, false});
+        // Retry modules even when a previous failed install left a venv behind.
+        g_steps.push_back({"Update Python installer", q(g_root + py) +
+                           " -m pip install --disable-pip-version-check --progress-bar off --upgrade pip setuptools wheel", g_root, false});
+        g_steps.push_back({"Python modules", q(g_root + py) +
+                           " -m pip install --disable-pip-version-check --progress-bar off --only-binary=:all: -r tools/requirements-linux.txt", g_root, false});
+        if (extract) g_steps.push_back({"Read your game files", q(g_root + py) + " -I tools/nsp_extract.py" + extract_args(), g_root, false});
+        if (recompile) {
+            Step s = {"Recompile (ARM64 to C)", "make gen PY=.venv-linux/bin/python", g_root, false};
+            s.weight = 3.5;
+            g_steps.push_back(s);
+        }
+        if (build) {
+            g_steps.push_back({"Build the native Linux version", "sh tools/build_linux.sh", g_root, false});
+        }
+#else
         std::string py = g_root + ".venv\\Scripts\\python.exe";
         if (!g_status.venv) {
             g_steps.push_back({"Python environment", "py -3.12 -m venv .venv", g_root, false});
@@ -940,6 +1032,7 @@ static void start_steps(bool extract, bool recompile, bool build) {
                                                         " PY=.venv/Scripts/python.exe build/mua3recomp.exe build/mua3game.dll build/.dlls",
                                g_root, true});
         }
+#endif
     }
     {
         std::lock_guard<std::mutex> lk(g_log_mu);
@@ -952,13 +1045,20 @@ static void cancel_steps(void) {
     g_cancel = true;
 #ifdef _WIN32
     if (g_job) TerminateJobObject(g_job, 1);
+#else
+    pid_t pid = g_active_pid.load();
+    if (pid > 0) kill(-pid, SIGTERM);
 #endif
 }
 
 // ================================================================== the game
 // wait_code: wait for the game to close and give its exit code (mua3launcher --play, as RecompLauncher starts it)
 static std::string launch_game(int *wait_code = nullptr) {
+#ifdef __linux__
+    std::string exe = g_root + "build/mua3recomp";
+#else
     std::string exe = g_release ? g_exe_dir + "mua3recomp.exe" : g_root + "build\\mua3recomp.exe";
+#endif
     if (!is_file(exe)) exe = g_exe_dir + "mua3recomp.exe";
     if (!is_file(exe)) return "The PC version isn't built yet: set up your game files first (GAME FILES).";
     if (!is_dir(g_root + "extracted")) return "No game files set up yet: choose them on GAME FILES, then INSTALL.";
@@ -992,7 +1092,45 @@ static std::string launch_game(int *wait_code = nullptr) {
     CloseHandle(pi.hProcess);
     return "";
 #else
-    return "Starting the game is only implemented on Windows.";
+    setenv("LARECOMP_DATA_ROOT", native_path(g_root).c_str(), 1);
+    pid_t pid = fork();
+    if (pid < 0) return "Couldn't start the game process.";
+    if (pid == 0) {
+        // Own the session so closing the launcher's terminal cannot hang up
+        // the game. Keep the real child PID so startup failure is observable.
+        if (setsid() < 0) _exit(126);
+        std::string cwd = native_path(g_root);
+        if (chdir(cwd.c_str()) != 0) _exit(126);
+        int out = open("play.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out >= 0) {
+            dup2(out, STDOUT_FILENO);
+            dup2(out, STDERR_FILENO);
+            if (out > STDERR_FILENO) close(out);
+        }
+        fprintf(stderr, "Starting native MUA3 Recomp (pid %ld)\n", (long)getpid());
+        fflush(stderr);
+        execl("/bin/sh", "sh", "tools/start_game_linux.sh", "extracted", (char *)NULL);
+        perror("Game launch");
+        _exit(127);
+    }
+    if (wait_code) {
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+        *wait_code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+    } else {
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            int status = 0;
+            pid_t done = waitpid(pid, &status, WNOHANG);
+            if (done == pid) {
+                int code = WIFEXITED(status) ? WEXITSTATUS(status) : WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1;
+                return "The game closed during startup (exit " + std::to_string(code) +
+                       "). See play.log and lasrecomp.log in the Linux folder.";
+            }
+            if (done < 0 && errno != EINTR) return "Couldn't monitor game startup: see play.log.";
+            SDL_Delay(50);
+        }
+    }
+    return "";
 #endif
 }
 
@@ -1201,6 +1339,12 @@ static void page_setup(SDL_Window *win) {
         check_mark(true);
         ImGui::TextUnformatted("Tools included: the extractor, the recompiler and the compiler (nothing else to install)");
     } else {
+#ifdef __linux__
+        check_mark(g_status.msys);
+        ImGui::TextUnformatted("Native Linux build (game setup needs clang, Vulkan and FFmpeg)");
+        check_mark(g_status.venv);
+        ImGui::TextUnformatted(g_status.venv ? "Python environment (.venv)" : "Python environment: made by INSTALL");
+#else
         check_mark(g_status.msys);
         row_label("MSYS2 (clang, make)", lw);
         ImGui::SetNextItemWidth(260 * g_scale);
@@ -1208,6 +1352,7 @@ static void page_setup(SDL_Window *win) {
         if (!g_status.msys) { ImGui::SameLine(); ImGui::TextColored(C_WARN, "not found: see the README"); }
         check_mark(g_status.venv);
         ImGui::TextUnformatted(g_status.venv ? "Python environment (.venv)" : "Python environment: made by INSTALL (needs Python 3.12)");
+#endif
     }
     ImGui::Spacing();
     bool inputs = p_base[0] && is_file(p_base) && p_keys[0] && is_file(p_keys) && p_update[0] && is_file(p_update) &&
@@ -1466,7 +1611,7 @@ static ImFont *load_font(float size, bool display = false) {  // display: Baloo 
                                "C:\\Windows\\Fonts\\segoeui.ttf"});
     for (const std::string &p : paths)
         if (is_file(p))
-            if (ImFont *f = io.Fonts->AddFontFromFileTTF(p.c_str(), size)) return f;
+            if (ImFont *f = io.Fonts->AddFontFromFileTTF(native_path(p).c_str(), size)) return f;
     return io.Fonts->AddFontDefault();
 }
 
@@ -1496,7 +1641,9 @@ static int prepare_cli(int argc, char **argv) {
         log_line(why);
         return 1;
     };
+#ifndef __linux__
     if (!g_release) return fail("This isn't a release folder (mua3gen, zig and gamelib-src next to the launcher).");
+#endif
     if (!p_base[0] || !is_file(p_base)) return fail("The game (an NSP or XCI of MARVEL ULTIMATE ALLIANCE 3) wasn't found: " + std::string(p_base));
     if (!p_keys[0] || !is_file(p_keys)) return fail("The keys file (prod.keys) wasn't found: " + std::string(p_keys));
     if (!p_update[0] || !is_file(p_update)) return fail("The 4.0.1 update (NSP) wasn't found: " + std::string(p_update));
@@ -1550,7 +1697,10 @@ int main(int argc, char **argv) {
         if (!e.empty()) { SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, APP, e.c_str(), NULL); return 1; }
         return code;
     }
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return 1;
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+        fprintf(stderr, "Launcher: SDL initialization failed: %s\n", SDL_GetError());
+        return 1;
+    }
     list_modes();
     g_settings_ini.load(g_root + "larecomp.ini");
     settings_from_ini();
@@ -1563,14 +1713,25 @@ int main(int argc, char **argv) {
     if (wh > g_desktop.h * 9 / 10) wh = g_desktop.h * 9 / 10;
     SDL_Window *win = SDL_CreateWindow("Marvel Ultimate Alliance 3 Recomp - Launcher", ww, wh,
                                        SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE);
-    if (win) SDL_SetWindowMinimumSize(win, std::min(ww, (int)(820 * g_scale)), std::min(wh, (int)(640 * g_scale)));
+    if (!win) {
+        fprintf(stderr, "Launcher: could not create the window: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+    SDL_SetWindowMinimumSize(win, std::min(ww, (int)(820 * g_scale)), std::min(wh, (int)(640 * g_scale)));
     SDL_Renderer *ren = win ? SDL_CreateRenderer(win, NULL) : NULL;
-    if (!ren) return 1;
+    if (!ren) {
+        fprintf(stderr, "Launcher: could not create the SDL renderer: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
     SDL_SetRenderVSync(ren, 1);
     SDL_Texture *art = NULL;
     for (const std::string &p : {g_exe_dir + "icon.png", g_root + "build\\icon.png"}) {
         if (art || !is_file(p)) continue;
-        if (SDL_Surface *s = SDL_LoadPNG(p.c_str())) {
+        std::string np = native_path(p);
+        if (SDL_Surface *s = SDL_LoadPNG(np.c_str())) {
             SDL_SetWindowIcon(win, s);
             art = SDL_CreateTextureFromSurface(ren, s);
             SDL_DestroySurface(s);
@@ -1802,6 +1963,11 @@ int main(int argc, char **argv) {
         ImGui::Render();
         SDL_SetRenderDrawColor(ren, 12, 10, 36, 255);
         SDL_RenderClear(ren);
+        // ImGui and SDL mouse events use window coordinates. On Wayland/HiDPI,
+        // the renderer targets more pixels than the window has logical units.
+        // Scale geometry and clip rectangles together so visible buttons and
+        // their input rectangles occupy the same place on the desktop.
+        SDL_SetRenderScale(ren, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), ren);
         {   // (test) MUA3_LAUNCHER_SHOT=<file.bmp>: the window's look saved after a few frames, then quit
             static int frames;
@@ -1824,6 +1990,7 @@ int main(int argc, char **argv) {
     }
     if (g_running) cancel_steps();
     if (g_worker.joinable()) g_worker.join();
+    if (g_cli_log) { fclose(g_cli_log); g_cli_log = nullptr; }
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();

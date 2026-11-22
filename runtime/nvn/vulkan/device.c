@@ -493,10 +493,28 @@ static void create_device(void) {
     VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .customBorderColors = VK_TRUE,
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
+    // The lifted compute programs run a divergent PC interpreter. Avoid making
+    // two 32-lane guest warps share one 64-lane subgroup on RDNA when the
+    // driver supports choosing 32. Other GPUs and unsupported drivers retain
+    // their existing behavior. The environment switch permits an A/B comparison.
+    VkPhysicalDeviceVulkan13Features subgroup_features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceFeatures2 subgroup_query = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &subgroup_features};
+    vkGetPhysicalDeviceFeatures2(g_vk.phys, &subgroup_query);
+    VkPhysicalDeviceVulkan13Properties subgroup_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    VkPhysicalDeviceProperties2 subgroup_properties = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &subgroup_props};
+    vkGetPhysicalDeviceProperties2(g_vk.phys, &subgroup_properties);
+    const char *wave32 = getenv("LARECOMP_VK_WAVE32");
+    g_vk.compute_subgroup32 = g_vk.props.vendorID == 0x1002 && subgroup_features.subgroupSizeControl &&
+        (subgroup_props.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+        subgroup_props.minSubgroupSize <= 32 && subgroup_props.maxSubgroupSize >= 32 &&
+        (!wave32 || atoi(wave32) != 0);
+    g_vk.subgroup32_max_invocations = subgroup_props.maxComputeWorkgroupSubgroups * 32;
+    LOG("[vk] AMD 32-lane compute subgroups: %s (supported range %u-%u)\n",
+        g_vk.compute_subgroup32 ? "on" : "off", subgroup_props.minSubgroupSize, subgroup_props.maxSubgroupSize);
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE,
+                                            .maintenance4 = VK_TRUE, .subgroupSizeControl = g_vk.compute_subgroup32,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
@@ -1137,6 +1155,14 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
             g_gpuprof_frame = true;
             LOG("[gpuprof] frame %llu took %.0f ms: profiling the next\n", (unsigned long long)frame, (now - last_ns) / 1e6);
         }
+        // Opt-in periodic samples let a Deck report actual gameplay passes,
+        // rather than only the earlier shader-compilation hitches.
+        const char *every_env = getenv("LARECOMP_GPUPROF_EVERY");
+        long every = every_env ? atol(every_env) : 0;
+        if (every > 0 && frame > 0 && frame % (uint64_t)every == 0) {
+            g_gpuprof_frame = true;
+            LOG("[gpuprof] periodic sample at frame %llu\n", (unsigned long long)frame);
+        }
         last_ns = now;
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)frame);
@@ -1404,6 +1430,63 @@ void backend_clear_window(void) {
     rq_drain();
     static const float black[4] = {0, 0, 0, 1};
     if (g_vk.dev && vk_frame_begin(black)) vk_frame_end(NULL);
+}
+
+// The boot's shader preparation (shader_prep.c boot_progress, on the game thread before its first frame): a progress
+// bar in the window, where the title isn't seen (Steam's Game Mode). The game thread queues nothing meanwhile, so,
+// as for backend_clear_window, the queue is drained and the frame drawn directly. Two cleared rectangles: no font,
+// no pipeline. done / total: 0..1.
+// A 5x7 font for the bar's label: the letters of "PRELOADING SHADERS", the digits and '%' (rows top down, 5 bits each).
+static const struct { char c; uint8_t row[7]; } load_font[] = {
+    {'A', {14, 17, 17, 31, 17, 17, 17}}, {'D', {30, 17, 17, 17, 17, 17, 30}}, {'E', {31, 16, 16, 30, 16, 16, 31}},
+    {'G', {14, 17, 16, 23, 17, 17, 15}}, {'H', {17, 17, 17, 31, 17, 17, 17}}, {'I', {14, 4, 4, 4, 4, 4, 14}},
+    {'L', {16, 16, 16, 16, 16, 16, 31}}, {'N', {17, 25, 21, 19, 17, 17, 17}}, {'O', {14, 17, 17, 17, 17, 17, 14}},
+    {'P', {30, 17, 17, 30, 16, 16, 16}}, {'R', {30, 17, 17, 30, 20, 18, 17}}, {'S', {15, 16, 16, 14, 1, 1, 30}},
+    {'0', {14, 17, 19, 21, 25, 17, 14}}, {'1', {4, 12, 4, 4, 4, 4, 14}}, {'2', {14, 17, 1, 2, 4, 8, 31}},
+    {'3', {30, 1, 1, 14, 1, 1, 30}}, {'4', {2, 6, 10, 18, 31, 2, 2}}, {'5', {31, 16, 30, 1, 1, 17, 14}},
+    {'6', {6, 8, 16, 30, 17, 17, 14}}, {'7', {31, 1, 2, 4, 8, 8, 8}}, {'8', {14, 17, 17, 14, 17, 17, 14}},
+    {'9', {14, 17, 17, 15, 1, 2, 12}}, {'%', {24, 25, 2, 4, 8, 19, 3}},
+};
+
+// The label's lit pixels as rectangles of s x s, text centred on cx with its top at y; returns how many (at most max)
+static uint32_t load_text(const char *text, int32_t cx, int32_t y, uint32_t s, VkClearRect *out, uint32_t max) {
+    uint32_t n = 0, len = (uint32_t)strlen(text);
+    int32_t x0 = cx - (int32_t)(len * 6 * s - s) / 2;
+    for (uint32_t i = 0; i < len; i++)
+        for (size_t g = 0; g < sizeof load_font / sizeof *load_font; g++) {
+            if (load_font[g].c != text[i]) continue;
+            for (int r = 0; r < 7; r++)
+                for (int b = 0; b < 5; b++)
+                    if ((load_font[g].row[r] >> (4 - b)) & 1 && n < max)
+                        out[n++] = (VkClearRect){.rect = {{x0 + (int32_t)((i * 6 + b) * s), y + r * (int32_t)s}, {s, s}}, .layerCount = 1};
+            break;
+        }
+    return n;
+}
+
+void backend_loading_frame(int done, int total) {
+    if (!g_vk.dev || total <= 0 || rq_stopping()) return;
+    rq_drain();
+    static const float bg[4] = {0.02f, 0.02f, 0.05f, 1};
+    if (!vk_frame_begin(bg)) return;
+    uint32_t w = g_vk.sc_extent.width, h = g_vk.sc_extent.height;
+    uint32_t bw = w * 6 / 10, bh = h / 40 > 6 ? h / 40 : 6, x = (w - bw) / 2, y = h * 3 / 4;
+    uint32_t fill = (uint32_t)((uint64_t)bw * (uint32_t)(done < 0 ? 0 : done > total ? total : done) / (uint32_t)total);
+    VkClearAttachment frame = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue.color.float32 = {0.25f, 0.25f, 0.3f, 1}};
+    VkClearAttachment bar = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue.color.float32 = {0.85f, 0.15f, 0.12f, 1}};
+    VkClearRect r0 = {.rect = {{(int32_t)x - 2, (int32_t)y - 2}, {bw + 4, bh + 4}}, .layerCount = 1};
+    VkClearRect r1 = {.rect = {{(int32_t)x, (int32_t)y}, {fill ? fill : 1, bh}}, .layerCount = 1};
+    VkCommandBuffer cb = vk_cmd();
+    rec_CmdClearAttachments(cb, 1, &frame, 1, &r0);
+    if (fill) rec_CmdClearAttachments(cb, 1, &bar, 1, &r1);
+    char label[48];
+    snprintf(label, sizeof label, "PRELOADING SHADERS %d%%", (int)((uint64_t)(done < 0 ? 0 : done > total ? total : done) * 100 / (uint32_t)total));
+    uint32_t s = h / 200 > 2 ? h / 200 : 2;
+    static VkClearRect px[1024];
+    uint32_t np = load_text(label, (int32_t)(w / 2), (int32_t)y - (int32_t)(12 * s), s, px, 1024);
+    VkClearAttachment ink = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .clearValue.color.float32 = {0.9f, 0.9f, 0.92f, 1}};
+    if (np) rec_CmdClearAttachments(cb, 1, &ink, np, px);
+    vk_frame_end(NULL);
 }
 
 int ui_run(void) {

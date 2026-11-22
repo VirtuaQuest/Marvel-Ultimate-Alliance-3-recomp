@@ -13,6 +13,7 @@
 #include <libavformat/avformat.h>
 #include <libavutil/time.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -20,7 +21,9 @@
 #include <sys/stat.h>
 
 #include "../hle.h"
+#include "../nvn/pace.h"
 #include "../settings.h"
+#include "../movie_convert.h"
 
 #define MOVIE_EOS 4u
 
@@ -188,12 +191,60 @@ static void ok(Cpu *c) { c->x[0] = 0; }
 uint64_t kernel_current_thread_id(void);  // (kernel.c: the LARECOMP_LOG_MOVIE_OPEN lines)
 bool romfs_file_find(const char *rel, uint64_t *off, uint64_t *size);
 ssize_t romfs_image_read(void *dst, uint64_t n, uint64_t off);
-typedef struct { uint64_t off, size, pos, nread, reads; } RomSrc;
+// The whole movie is read into memory on a thread of its own from the start (8 MB at a time, from the NSP: decrypted
+// as it goes), and the demuxer reads from there once that part is in. Reading it in 64 KB pieces on demand put each
+// piece behind the game's own loading (a Steam Deck: hundreds of MB of the next level read during a story movie) and
+// the game's player paused audio and video for a second or two while it waited. Movies over 1 GB: on demand only.
+typedef struct {
+    uint64_t off, size, pos, nread, reads;
+    uint8_t *mem;      // (the prefetch: the file, its first `loaded` bytes in)
+    uint64_t loaded;   // (__atomic builtins)
+    volatile bool stop;
+    pthread_t th;
+    bool th_on;
+} RomSrc;
+static void *rom_prefetch(void *o) {
+    RomSrc *s = o;
+    const uint64_t chunk = 8ull << 20;
+    uint64_t t0 = plat_now_ns();
+    for (uint64_t at = 0; at < s->size && !s->stop;) {
+        uint64_t n = s->size - at < chunk ? s->size - at : chunk;
+        if (romfs_image_read(s->mem + at, n, s->off + at) != (ssize_t)n) {
+            LOG("[movie] prefetch: read failed at %llu: the rest on demand\n", (unsigned long long)at);
+            return NULL;
+        }
+        at += n;
+        __atomic_store_n(&s->loaded, at, __ATOMIC_RELEASE);
+    }
+    if (!s->stop)
+        LOG("[movie] prefetch: %.1f MB in memory in %.0f ms\n", s->size / 1048576.0, (plat_now_ns() - t0) / 1e6);
+    return NULL;
+}
+static void rom_free(RomSrc *s) {
+    if (!s) return;
+    s->stop = true;
+    if (s->th_on) pthread_join(s->th, NULL);
+    free(s->mem);
+    free(s);
+}
 static int rom_avio_read(void *o, uint8_t *buf, int n) {
     RomSrc *s = o;
     if (s->pos >= s->size) return AVERROR_EOF;
     if ((uint64_t)n > s->size - s->pos) n = (int)(s->size - s->pos);
+    if (s->mem && s->pos + (uint64_t)n <= __atomic_load_n(&s->loaded, __ATOMIC_ACQUIRE)) {
+        memcpy(buf, s->mem + s->pos, (size_t)n);
+        s->pos += (uint64_t)n;
+        s->nread += (uint64_t)n, s->reads++;
+        return n;
+    }
+    uint64_t t0 = plat_now_ns();
     ssize_t r = romfs_image_read(buf, (uint64_t)n, s->off + s->pos);
+    uint64_t dt = plat_now_ns() - t0;
+    if (dt > 50000000ull) {
+        static int said;
+        if (said++ < 50) LOG("[movie] slow read: %.0f ms for %d bytes at %llu (prefetched %llu)\n", dt / 1e6, n,
+                             (unsigned long long)s->pos, (unsigned long long)__atomic_load_n(&s->loaded, __ATOMIC_ACQUIRE));
+    }
     if (r <= 0) return AVERROR_EOF;
     s->pos += (uint64_t)r;
     s->nread += (uint64_t)r, s->reads++;
@@ -223,7 +274,7 @@ typedef struct {
 static void ex_close_input(Extractor *e) {
     if (e->fmt) avformat_close_input(&e->fmt);
     if (e->avio) { av_freep(&e->avio->buffer); avio_context_free(&e->avio); }
-    free(e->rom);
+    rom_free(e->rom);
     e->rom = NULL;
 }
 
@@ -330,6 +381,10 @@ static void ex_open_path(Cpu *c, const char *path) {
         e->fmt = avformat_alloc_context();
         if (buf && e->rom && e->fmt) {
             *e->rom = (RomSrc){roff, rsize, 0};
+            if (rsize && rsize <= (1ull << 30) && (e->rom->mem = malloc(rsize))) {
+                if (pthread_create(&e->rom->th, NULL, rom_prefetch, e->rom) == 0) e->rom->th_on = true;
+                else free(e->rom->mem), e->rom->mem = NULL;
+            }
             e->avio = avio_alloc_context(buf, 1 << 16, 0, e->rom, rom_avio_read, NULL, rom_avio_seek);
         }
         if (e->avio) e->fmt->pb = e->avio;
@@ -528,7 +583,8 @@ HLE_FUNC("_ZN5movie9ExtractorC1ENS_13ContainerTypeE", movie_extractor_ctor) {
 // ------------------------------------------------------------------ Decoder
 #define NIN 4
 #define NOUT 6
-#define NPENDING 16
+#define NPENDING 64
+#define PQ_MAX 1024  // compressed packets queued ahead of decoding (dec_send_input)
 
 typedef struct {
     int idx;
@@ -539,6 +595,10 @@ typedef struct {
 typedef struct {
     AVCodecContext *ctx;
     AVFrame *frame;
+    AVFrame *swf;  // (VAAPI: the decoded surface downloaded, NV12)
+    bool hw;       // VAAPI hardware decoding
+    uint64_t gap_send, gap_out, refused_since;  // (movie_gap: the last input taken, output handed out; refusing since)
+    int refused_why;
     AVPacket *pkt;
     bool video;
     uint64_t events[4];  // input available, output available, format changed, error
@@ -552,10 +612,19 @@ typedef struct {
     int nready;
     int width, height, stride, sample_rate, channels;
     struct SwsContext *sws;
+    MovieConverter *converter;
+    bool converter_tried;
+    bool paced;  // (nvn/pace.c: counted as a running video decoder, movies held to 30 fps)
+    uint64_t convert_ns, convert_max_ns, convert_frames;
+    uint64_t decode_ns, decode_max_ns, decode_packets;
     uint8_t *rgba;
     AVFrame *pending[NPENDING];
     int64_t pending_time[NPENDING];
     int npending;
+    AVPacket *pq[PQ_MAX];  // (input taken but not decoded yet: decode_queued)
+    int pq_n;
+    bool pq_eos;           // (end of stream behind them)
+    int64_t pq_eos_time;
     bool eos_pending;
     int64_t eos_time;
     bool stopped;  // Stop / destroyed: no more events (see dec_stop)
@@ -601,6 +670,17 @@ typedef struct NvnTexture NvnTexture;
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride);
 bool renderer_upload_nv12(NvnTexture *t, const void *nv12, uint32_t w, uint32_t h, uint32_t stride, uint32_t uv_off);
 
+// Video on the GPU's decoder (VAAPI: the Steam Deck's, through the system's libva) where the driver takes the stream;
+// otherwise FFmpeg falls back to software decoding by itself. On a Steam Deck, software H.264 on four threads competed
+// with the game's loading threads during the story movies: decode calls of 20-48 ms in runs, and the game's player
+// pausing audio and video for a second or two to buffer. LARECOMP_MOVIE_HWDEC=0: software only.
+static enum AVPixelFormat hw_format(AVCodecContext *ctx, const enum AVPixelFormat *fmts) {
+    (void)ctx;
+    for (const enum AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++)
+        if (*p == AV_PIX_FMT_VAAPI) return *p;
+    return fmts[0];  // (the software format: this stream's profile isn't one the hardware decodes)
+}
+
 static void dec_configure(Cpu *c) {
     Decoder *d = self_state(c);
     MediaData *m = md(c->x[1]);
@@ -611,8 +691,23 @@ static void dec_configure(Cpu *c) {
     d->ctx = avcodec_alloc_context3(codec);
     avcodec_parameters_to_context(d->ctx, p);
     d->ctx->thread_count = 4;
+    const char *hwe = getenv("LARECOMP_MOVIE_HWDEC");
+    if (p->codec_type == AVMEDIA_TYPE_VIDEO && (!hwe || !*hwe || atoi(hwe) != 0)) {
+        AVBufferRef *dev = NULL;
+        int r = av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
+        if (r >= 0) {
+            d->ctx->hw_device_ctx = av_buffer_ref(dev);
+            d->ctx->get_format = hw_format;
+            d->ctx->thread_count = 1;  // (the hardware decodes; one thread feeds it)
+            av_buffer_unref(&dev);
+            d->hw = true;
+        } else {
+            LOG("[movie] no VAAPI device (%s): software decoding\n", av_err2str(r));
+        }
+    }
     if (avcodec_open2(d->ctx, codec, NULL) < 0) { LOG("[movie] cannot open decoder\n"); c->x[0] = 1; return; }
     d->frame = av_frame_alloc();
+    if (d->hw) d->swf = av_frame_alloc();
     d->pkt = av_packet_alloc();
     d->video = p->codec_type == AVMEDIA_TYPE_VIDEO;
     d->width = p->width;
@@ -624,7 +719,8 @@ static void dec_configure(Cpu *c) {
     d->out_cap = d->video ? (uint32_t)(d->stride * d->height * 3 / 2) : 64 << 10;
     for (int i = 0; i < NIN; i++) d->in_mem[i] = buf_get(d->in_cap);
     for (int i = 0; i < NOUT; i++) d->out_mem[i] = buf_get(d->out_cap);
-    LOG("[movie] decoder %s configured: %dx%d %d Hz %d ch\n", codec->name, d->width, d->height, d->sample_rate, d->channels);
+    LOG("[movie] decoder %s configured: %dx%d %d Hz %d ch%s\n", codec->name, d->width, d->height, d->sample_rate, d->channels,
+        d->hw ? " (VAAPI hardware decoding)" : "");
     if (getenv("LARECOMP_LOG_MOVIE_OPEN"))
         LOG("[movie] (t%llu) configured in %.2f ms\n", (unsigned long long)kernel_current_thread_id(), (plat_now_ns() - tc0) / 1e6);
     c->x[0] = 0;
@@ -680,6 +776,7 @@ static void dec_start(Cpu *c) {
     Decoder *d = self_state(c);
     pthread_mutex_lock(&d->lock);
     d->stopped = false;
+    if (d->video && !d->paced) d->paced = true, pace_movie_active(1);
     pthread_mutex_unlock(&d->lock);
     dec_signal(c, d, 0);  // all input buffers are free
     c->x[0] = 0;
@@ -697,6 +794,7 @@ static void dec_stop(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     if (!d->stopped) {
         d->stopped = true;
+        if (d->paced) d->paced = false, pace_movie_active(-1);
         LOG("[movie] decoder %s stopped\n", d->video ? "video" : "audio");
         uint64_t saved[8];
         memcpy(saved, c->x, sizeof saved);
@@ -718,6 +816,20 @@ static void movie_stats(void) {
     last = now;
 }
 
+// Movie stalls (the game's player pausing audio and video for a second or two): each gap over 150 ms between inputs
+// the game hands a decoder or outputs it takes, and every stretch over 150 ms of input refused, with the decoder's
+// state - which side waits for which. "[movie-gap]" lines (at most 300 a run).
+static void movie_gap(Decoder *d, const char *what, uint64_t ms) {
+    static int said;
+    if (said++ >= 300) return;
+    int out_free = 0, in_free = 0;
+    for (int i = 0; i < NOUT; i++) out_free += !d->out_busy[i];
+    for (int i = 0; i < NIN; i++) in_free += !d->in_busy[i];
+    LOG("[movie-gap] %s %s: %llu ms (t=%.2f; outputs free %d of %d, ready %d, pending %d, inputs free %d of %d)\n",
+        d->video ? "video" : "audio", what, (unsigned long long)ms, plat_now_ns() / 1e9, out_free, NOUT, d->nready,
+        d->npending, in_free, NIN);
+}
+
 static void dec_acquire_input(Cpu *c) {
     Decoder *d = self_state(c);
     n_acq_in++;
@@ -725,13 +837,29 @@ static void dec_acquire_input(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     int out_free = 0;
     for (int i = 0; i < NOUT; i++) if (!d->out_busy[i]) out_free++;
-    if (out_free < 2 || d->npending) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }  // backpressure
     int idx = -1, free_n = 0;
-    for (int i = 0; i < NIN; i++)
-        if (!d->in_busy[i]) { if (idx < 0) idx = i; else free_n++; }
-    if (idx >= 0) d->in_busy[idx] = true;
+    // Input is taken whenever there's room in the packet queue, whatever the outputs (decode_queued decodes as they
+    // free). Refusing it while the outputs were full (6 audio frames: 128 ms) stopped the game's demuxer, which feeds
+    // both decoders in the file's order: the movie's ~0.8 s interleave blocks of audio and video took turns stalling
+    // the other stream - the player paused both for a second or two every few seconds (a Steam Deck, every story movie).
+    bool full = d->pq_n >= PQ_MAX - NIN;
+    (void)out_free;
+    if (!full)
+        for (int i = 0; i < NIN; i++)
+            if (!d->in_busy[i]) { if (idx < 0) idx = i; else free_n++; }
+    uint64_t now = plat_now_ns();
+    if (idx < 0) {
+        if (!d->refused_since) d->refused_since = now, d->refused_why = full ? 1 : 2;
+        pthread_mutex_unlock(&d->lock);
+        c->x[0] = 1;
+        return;
+    }
+    if (d->refused_since && now - d->refused_since > 150000000ull)
+        movie_gap(d, d->refused_why == 1 ? "input refused (outputs not released)" : "input refused (no free input buffer)",
+                  (now - d->refused_since) / 1000000);
+    d->refused_since = 0;
+    d->in_busy[idx] = true;
     pthread_mutex_unlock(&d->lock);
-    if (idx < 0) { c->x[0] = 1; return; }
     *(int32_t *)(uintptr_t)c->x[1] = idx;
     if (c->x[2]) *(int32_t *)(uintptr_t)c->x[2] = free_n;
     c->x[0] = 0;
@@ -760,6 +888,9 @@ static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
     } else if (d->video) {
         int h = d->height, w = d->width, uv_off = d->stride * h;
         for (int y = 0; y < h; y++) memcpy(o + y * d->stride, f->data[0] + y * f->linesize[0], w);
+        if (f->format == AV_PIX_FMT_NV12)  // (VAAPI: already NV12)
+            for (int y = 0; y < h / 2; y++) memcpy(o + uv_off + y * d->stride, f->data[1] + y * f->linesize[1], w);
+        else
         for (int y = 0; y < h / 2; y++) {  // interleave U and V into NV12
             uint8_t *uv = o + uv_off + y * d->stride;
             const uint8_t *u = f->data[1] + y * f->linesize[1], *v = f->data[2] + y * f->linesize[2];
@@ -808,6 +939,69 @@ static bool flush_pending(Decoder *d) {
     return any;
 }
 
+// Frames decoded ahead into the pending queue before packets wait compressed instead (video frames are 3 MB each)
+static int dec_ahead(const Decoder *d) { return d->video ? 3 : 32; }
+
+// Everything the decoder has ready, into output slots or the pending queue (in order); caller holds the lock.
+// Returns the frames received; *produced: one went to an output slot or the queue.
+static int receive_all(Decoder *d, int64_t time, bool *produced) {
+    int nframes = 0;
+    while (avcodec_receive_frame(d->ctx, d->frame) == 0) {
+        nframes++;
+        int64_t t = d->frame->pts != AV_NOPTS_VALUE ? d->frame->pts : time;
+        AVFrame *f = d->frame;
+        if (d->hw && f->format != AV_PIX_FMT_VAAPI) {  // (the driver refused the stream: software on one thread)
+            static int said;
+            if (!said++) LOG("[movie] VAAPI didn't take this stream: software decoding on one thread (LARECOMP_MOVIE_HWDEC=0: four)\n");
+        }
+        if (f->format == AV_PIX_FMT_VAAPI) {  // (the surface downloaded: NV12, which the output slot takes as it is)
+            av_frame_unref(d->swf);
+            d->swf->format = AV_PIX_FMT_NV12;
+            if (av_hwframe_transfer_data(d->swf, f, 0) < 0) {
+                static int said;
+                if (!said++) LOG("[movie] VAAPI frame download failed: frame dropped\n");
+                continue;
+            }
+            f = d->swf;
+        }
+        // keep order: queue behind anything already pending
+        if (d->npending || !emit_frame(d, f, t, 0)) {
+            if (d->npending < NPENDING) {
+                d->pending[d->npending] = av_frame_clone(f);
+                d->pending_time[d->npending++] = t;
+            } else {
+                LOG("[movie] output queue full, dropping frame\n");
+            }
+        }
+        n_frames++;
+        *produced = true;
+    }
+    return nframes;
+}
+
+// Queued packets decoded while the pending queue has room (and the end of stream once they're done); caller holds
+// the lock. True: a frame went out.
+static bool decode_queued(Decoder *d) {
+    bool produced = false;
+    while (d->pq_n && d->npending < dec_ahead(d)) {
+        AVPacket *p = d->pq[0];
+        memmove(d->pq, d->pq + 1, (size_t)--d->pq_n * sizeof *d->pq);
+        int64_t t = p->pts;
+        avcodec_send_packet(d->ctx, p);
+        av_packet_free(&p);
+        receive_all(d, t, &produced);
+    }
+    if (!d->pq_n && d->pq_eos) {
+        d->pq_eos = false;
+        avcodec_send_packet(d->ctx, NULL);
+        receive_all(d, d->pq_eos_time, &produced);
+        d->eos_pending = true;
+        d->eos_time = d->pq_eos_time;
+    }
+    produced |= flush_pending(d);
+    return produced;
+}
+
 static void dec_send_input(Cpu *c) {
     Decoder *d = self_state(c);
     n_send++;
@@ -815,31 +1009,73 @@ static void dec_send_input(Cpu *c) {
     int64_t time = (int64_t)c->x[4];
     uint32_t flags = (uint32_t)c->x[5];
     pthread_mutex_lock(&d->lock);
+    { uint64_t now = plat_now_ns();
+      if (d->gap_send && now - d->gap_send > 150000000ull) movie_gap(d, "no input sent", (now - d->gap_send) / 1000000);
+      d->gap_send = now; }
+    uint64_t decode_start = d->video ? plat_now_ns() : 0, send_ns = 0;
+    bool key = false, produced = false;
+    int nframes = 0;
+    bool queue = d->pq_n || d->npending >= dec_ahead(d);  // (behind queued packets, or enough decoded ahead)
     if (size > 0 && idx >= 0 && idx < NIN) {
         av_packet_unref(d->pkt);
         d->pkt->data = d->in_mem[idx] + off;
         d->pkt->size = size;
         d->pkt->pts = time;
-        avcodec_send_packet(d->ctx, d->pkt);
-    }
-    if (flags & MOVIE_EOS) avcodec_send_packet(d->ctx, NULL);
-    bool produced = false;
-    while (avcodec_receive_frame(d->ctx, d->frame) == 0) {
-        int64_t t = d->frame->pts != AV_NOPTS_VALUE ? d->frame->pts : time;
-        // keep order: queue behind anything already pending
-        if (d->npending || !emit_frame(d, d->frame, t, 0)) {
-            if (d->npending < NPENDING) {
-                d->pending[d->npending] = av_frame_clone(d->frame);
-                d->pending_time[d->npending++] = t;
+        if (d->video && size > 4) {  // (an IDR slice, NAL type 5, in the first NAL units: for the slow-packet log)
+            const uint8_t *p = d->pkt->data;
+            for (int k = 0; k + 4 < size && k < 256; k++)
+                if (p[k] == 0 && p[k + 1] == 0 && p[k + 2] == 1 && (p[k + 3] & 0x1f) == 5) { key = true; break; }
+        }
+        if (queue) {  // (a copy: the input buffer goes back to the game now)
+            AVPacket *q = av_packet_alloc();
+            if (q && av_new_packet(q, size) == 0 && d->pq_n < PQ_MAX) {
+                memcpy(q->data, d->pkt->data, (size_t)size);
+                q->pts = time;
+                d->pq[d->pq_n++] = q;
             } else {
-                LOG("[movie] output queue full, dropping frame\n");
+                av_packet_free(&q);
+                LOG("[movie] packet queue full: decoding now\n");
+                queue = false;
+                while (d->pq_n) {  // (in order: what's queued first, however much is decoded ahead)
+                    AVPacket *p = d->pq[0];
+                    memmove(d->pq, d->pq + 1, (size_t)--d->pq_n * sizeof *d->pq);
+                    int64_t t = p->pts;
+                    avcodec_send_packet(d->ctx, p);
+                    av_packet_free(&p);
+                    receive_all(d, t, &produced);
+                }
             }
         }
-        n_frames++;
-        produced = true;
+        if (!queue) {
+            avcodec_send_packet(d->ctx, d->pkt);
+            if (d->video) send_ns = plat_now_ns() - decode_start;
+        }
     }
-    if (flags & MOVIE_EOS) { d->eos_pending = true; d->eos_time = time; }
+    if (flags & MOVIE_EOS) {
+        if (queue) d->pq_eos = true, d->pq_eos_time = time;
+        else avcodec_send_packet(d->ctx, NULL);
+    }
+    if (!queue) nframes = receive_all(d, time, &produced);
+    if ((flags & MOVIE_EOS) && !queue) { d->eos_pending = true; d->eos_time = time; }
     produced |= flush_pending(d);
+    produced |= decode_queued(d);
+    if (d->video) {
+        uint64_t elapsed = plat_now_ns() - decode_start;
+        d->decode_ns += elapsed;
+        if (elapsed > d->decode_max_ns) d->decode_max_ns = elapsed;
+        if (elapsed > 20000000ull) {  // (a stall the game's player waits out: what kind of packet, where the time went)
+            static int said;
+            if (said++ < 200)
+                LOG("[movie-perf] slow packet: %.1f ms (send %.1f ms, %d frames out, %d pending, %s, %d bytes, t=%.2f)\n",
+                    elapsed / 1e6, send_ns / 1e6, nframes, d->npending, key ? "keyframe" : "not a keyframe", size,
+                    plat_now_ns() / 1e9);
+        }
+        if (++d->decode_packets % 120 == 0) {
+            LOG("[movie-perf] decode/pack avg %.2f ms max %.2f ms (120 packets)\n",
+                d->decode_ns / 120e6, d->decode_max_ns / 1e6);
+            d->decode_ns = d->decode_max_ns = 0;
+        }
+    }
     if (idx >= 0 && idx < NIN) d->in_busy[idx] = false;
     pthread_mutex_unlock(&d->lock);
     dec_signal(c, d, 0);
@@ -852,6 +1088,9 @@ static void dec_acquire_output(Cpu *c) {
     n_acq_out++;
     pthread_mutex_lock(&d->lock);
     if (!d->nready) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }
+    { uint64_t now = plat_now_ns();
+      if (d->gap_out && now - d->gap_out > 150000000ull) movie_gap(d, "no output taken", (now - d->gap_out) / 1000000);
+      d->gap_out = now; }
     OutReady r = d->ready[0];
     memmove(d->ready, d->ready + 1, --d->nready * sizeof *d->ready);
     int remaining = d->nready;
@@ -881,14 +1120,47 @@ static void dec_get_output_buffer(Cpu *c) {
             c->x[0] = 0;
             return;
         }
+        uint64_t convert_start = plat_now_ns();
+        if (!d->converter_tried) {
+            const char *e = getenv("LARECOMP_MOVIE_CONVERT_THREADS");
+            int threads = e ? atoi(e) : 2;
+            if (threads < 1 || threads > 4) threads = 2;
+            d->converter = movie_converter_create(w, h, threads);
+            d->converter_tried = true;
+            LOG("[movie] CPU color conversion: %s (%d worker%s requested)\n",
+                d->converter ? "FFmpeg frame/slice path" : "legacy fallback", threads, threads == 1 ? "" : "s");
+        }
+        const AVFrame *rgba = movie_converter_run(d->converter, d->out_mem[i], d->stride);
+        if (rgba) {
+            uint64_t elapsed = plat_now_ns() - convert_start;
+            d->convert_ns += elapsed;
+            if (elapsed > d->convert_max_ns) d->convert_max_ns = elapsed;
+            if (++d->convert_frames % 120 == 0) {
+                LOG("[movie-perf] CPU color avg %.2f ms max %.2f ms (120 frames)\n",
+                    d->convert_ns / 120e6, d->convert_max_ns / 1e6);
+                d->convert_ns = d->convert_max_ns = 0;
+            }
+            renderer_upload_rgba(t, rgba->data[0], (uint32_t)w, (uint32_t)h, (uint32_t)rgba->linesize[0]);
+            c->x[0] = 0;
+            return;
+        }
+        // Allocation, option, or conversion failure: retain the working legacy path for this decoder.
+        if (d->converter) {
+            LOG("[movie] threaded color conversion failed; using legacy conversion\n");
+            movie_converter_free(d->converter); d->converter = NULL;
+        }
         if (!d->sws)
             d->sws = sws_getContext(w, h, AV_PIX_FMT_NV12, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
         if (!d->rgba) d->rgba = malloc((size_t)w * h * 4);
-        const uint8_t *src[2] = {d->out_mem[i], d->out_mem[i] + d->stride * h};
-        int src_stride[2] = {d->stride, d->stride};
-        uint8_t *dst[1] = {d->rgba};
-        int dst_stride[1] = {w * 4};
-        sws_scale(d->sws, src, src_stride, 0, h, dst, dst_stride);
+        const uint8_t *src[4] = {d->out_mem[i], d->out_mem[i] + d->stride * h, NULL, NULL};
+        int src_stride[4] = {d->stride, d->stride, 0, 0};
+        uint8_t *dst[4] = {d->rgba, NULL, NULL, NULL};
+        int dst_stride[4] = {w * 4, 0, 0, 0};
+        if (!d->sws || !d->rgba || sws_scale(d->sws, src, src_stride, 0, h, dst, dst_stride) != h) {
+            LOG("[movie] CPU color conversion failed\n");
+            c->x[0] = 1;
+            return;
+        }
         renderer_upload_rgba(t, d->rgba, (uint32_t)w, (uint32_t)h, (uint32_t)w * 4);
         c->x[0] = 0;
         return;
@@ -922,6 +1194,7 @@ static void dec_release_output(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     if (i >= 0 && i < NOUT) d->out_busy[i] = false;
     bool produced = flush_pending(d);
+    produced |= decode_queued(d);
     pthread_mutex_unlock(&d->lock);
     if (produced) dec_signal_output(c, d);
     c->x[0] = 0;
@@ -932,10 +1205,14 @@ static void dec_release_output(Cpu *c) {
 static void dec_free(Decoder *d) {
     if (d->ctx) avcodec_free_context(&d->ctx);
     for (int i = 0; i < d->npending; i++) av_frame_free(&d->pending[i]);
+    for (int i = 0; i < d->pq_n; i++) av_packet_free(&d->pq[i]);
+    d->pq_n = 0, d->pq_eos = false;
     d->npending = d->nready = 0;
     av_frame_free(&d->frame);
+    av_frame_free(&d->swf);
     av_packet_free(&d->pkt);
     if (d->sws) sws_freeContext(d->sws), d->sws = NULL;
+    movie_converter_free(d->converter); d->converter = NULL;
     free(d->rgba), d->rgba = NULL;
 }
 
@@ -958,7 +1235,9 @@ RT_ON_RESET(movie_reset) {
         Extractor *e = g_movie_objs[0][i];
         if (e && e->pkt) av_packet_free(&e->pkt);
         if (e && e->fmt) avformat_close_input(&e->fmt);
+        if (e) rom_free(e->rom), e->rom = NULL;  // (its prefetch thread stopped)
         Decoder *d = g_movie_objs[1][i];
+        if (d && d->paced) d->paced = false, pace_movie_active(-1);
         if (d) dec_free(d);
         g_movie_objs[0][i] = g_movie_objs[1][i] = NULL;
     }

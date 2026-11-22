@@ -1,16 +1,16 @@
 # MUA3 4.0.1: the shader variants of the title, menus, the opening movie and the first level (shader hashes and
 # pipeline state only; the code is found in the player's own game files: shader_code_locs.txt)
-C cs=15a419a5822c53fc l=1024,1,1
-C cs=15a419a5822c53fc l=1024,1,1 st=440000
+C cs=15a419a5822c53fc l=1024,1,1 sm=4
+C cs=15a419a5822c53fc l=1024,1,1 st=440000 sm=4
 C cs=196cb50420a42c50 l=64,1,1
 C cs=1f7be40da47b2ecd l=1,1,1
 C cs=1f7be40da47b2ecd l=1,1,1 st=440000
-C cs=337be88cfd352149 l=64,1,1
-C cs=337be88cfd352149 l=64,1,1 st=440000
+C cs=337be88cfd352149 l=64,1,1 sm=512
+C cs=337be88cfd352149 l=64,1,1 st=440000 sm=512
 C cs=515307034c8e0ee6 l=64,1,1
 C cs=5692e7f979d2d385 l=32,1,1
-C cs=5f0b5ab6e87d8995 l=64,1,1
-C cs=5f0b5ab6e87d8995 l=64,1,1 st=440000
+C cs=5f0b5ab6e87d8995 l=64,1,1 sm=1024
+C cs=5f0b5ab6e87d8995 l=64,1,1 st=440000 sm=1024
 C cs=716cbb66fc483783 l=64,1,1
 C cs=73ab1f8e4787d913 l=1,1,1
 C cs=7ac4c03aa93e41f5 l=64,1,1

@@ -43,6 +43,7 @@ typedef struct {
     uint8_t topo;            // primitive class: 0 points, 1 lines, 2 triangles
     uint8_t poly_fill;       // filled polygons (0: lines)
     uint32_t local[3];       // compute: local size
+    uint32_t shared_bytes;   // compute: NVN shared allocation; 0 for old records (48 KB fallback)
     uint32_t stencil;        // compute: texture slots sampled as stencil (ShaderKey.tex_stencil_mask; " st=", 0: none)
     uint64_t tbuf[2];        // graphics: vertex, fragment slots holding buffer textures (ShaderKey.tex_buffer; " tb=", 0: none)
 } ShaderRec;

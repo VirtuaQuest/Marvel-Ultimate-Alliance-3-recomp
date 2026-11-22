@@ -7,8 +7,10 @@
 #include <ctype.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "../hle.h"
 #include "../nvn/nvn.h"
@@ -348,17 +350,56 @@ int input_family_of_type(int type) {
     default: return 1;
     }
 }
-static _Atomic int pad_family;
+static _Atomic int pad_family, pad_style;
+
+// The game's button icons (runtime/nvn/mua3_prompts.c) also tell Valve's controllers apart: style 3 Steam Deck,
+// 4 Steam Controller (both A on the bottom, so family 1 for our menus). By USB ids (Valve 28de: Deck 1205, Steam
+// Controller 1102 / 1142 / 1106), else by name: under Steam Input every controller is a "Steam Virtual Gamepad"
+// (28de:11ff) that Steam names after the real one; a generic one on a Steam Deck's own hardware is its controls.
+static bool contains_nocase(const char *hay, const char *needle) {
+    if (!hay) return false;
+    size_t n = strlen(needle);
+    for (; *hay; hay++)
+        if (!strncasecmp(hay, needle, n)) return true;
+    return false;
+}
+static bool on_steam_deck(void) {
+    static int deck = -1;
+    if (deck < 0) {
+        char b[64] = "";
+        FILE *f = fopen("/sys/devices/virtual/dmi/id/board_name", "r");
+        if (f) { if (!fgets(b, sizeof b, f)) b[0] = 0; fclose(f); }
+        deck = contains_nocase(b, "Jupiter") || contains_nocase(b, "Galileo") ||
+               (getenv("SteamDeck") && atoi(getenv("SteamDeck")) == 1);
+    }
+    return deck;
+}
+static int style_of_pad(SDL_Gamepad *g, int family) {
+    if (!g) return family;
+    const char *name = SDL_GetGamepadName(g);
+    uint16_t vid = SDL_GetGamepadVendor(g), pid = SDL_GetGamepadProduct(g);
+    if (contains_nocase(name, "Steam Deck")) return 3;
+    if (contains_nocase(name, "Steam Controller")) return 4;
+    if (vid == 0x28de && pid == 0x1205) return 3;
+    if (vid == 0x28de && (pid == 0x1102 || pid == 0x1142 || pid == 0x1106)) return 4;
+    if (family == 1 && on_steam_deck() && (vid == 0x28de || !name || contains_nocase(name, "Steam") ||
+                                           contains_nocase(name, "Virtual") || contains_nocase(name, "Xbox 360")))
+        return 3;  // (Steam Input's pad on a Deck, named after nothing else: the Deck's own controls)
+    return family;
+}
 static void note_family(void) {
-    int f = pad ? input_family_of_type(SDL_GetGamepadType(pad)) : 0;
-    if (f != pad_family) LOG("[input] button prompts: %s controller\n", f == 1 ? "Xbox" : f == 2 ? "PlayStation" : "Nintendo");
+    int f = pad ? input_family_of_type(SDL_GetGamepadType(pad)) : 0, s = style_of_pad(pad, f);
+    static const char *const names[] = {"Nintendo", "Xbox", "PlayStation", "Steam Deck", "Steam Controller"};
+    if (f != pad_family || s != pad_style) LOG("[input] button prompts: %s controller\n", names[s]);
     pad_family = f;
+    pad_style = s;
 }
 int input_pad_family(void) {
     static int env = -2, launcher = -2;
     if (env == -2) {
         const char *e = getenv("LARECOMP_PAD_TYPE");
-        env = !e ? -1 : !strcmp(e, "xbox") ? 1 : !strcmp(e, "playstation") || !strcmp(e, "ps") ? 2 : 0;
+        env = !e ? -1 : !strcmp(e, "xbox") || !strcmp(e, "steamdeck") || !strcmp(e, "steamcontroller") ? 1 :
+              !strcmp(e, "playstation") || !strcmp(e, "ps") ? 2 : 0;
         // RecompLauncher names the controller it saw (RECOMPLAUNCHER_PAD=xbox|playstation): its button names from
         // the first frame, until the game has a controller of its own to go by
         e = getenv("RECOMPLAUNCHER_PAD");
@@ -366,6 +407,19 @@ int input_pad_family(void) {
     }
     if (env >= 0) return env;
     return !pad && launcher >= 0 ? launcher : pad_family;
+}
+
+// The button icons' style (0 Nintendo, 1 Xbox, 2 PlayStation, 3 Steam Deck, 4 Steam Controller) of the game's
+// controller. LARECOMP_PAD_TYPE=steamdeck|steamcontroller pretends one is attached (tests).
+int input_prompt_style(void) {
+    static int env = -2;
+    if (env == -2) {
+        const char *e = getenv("LARECOMP_PAD_TYPE");
+        env = !e ? -1 : !strcmp(e, "steamdeck") ? 3 : !strcmp(e, "steamcontroller") ? 4 : -1;
+    }
+    if (env >= 0) return env;
+    if (getenv("LARECOMP_PAD_TYPE") || !pad) return input_pad_family();
+    return pad_style;
 }
 
 // Our menus' face buttons: the family whose button names they show, and (Confirm button = Controller convention, #172)
@@ -378,6 +432,8 @@ int input_menu_family(SDL_JoystickID which) {
     case PROMPTS_NINTENDO: return 0;
     case PROMPTS_XBOX: return 1;
     case PROMPTS_PLAYSTATION: return 2;
+    case PROMPTS_STEAMDECK:
+    case PROMPTS_STEAMCTRL: return 1;  // (A on the bottom, like Xbox)
     default: break;
     }
     if (getenv("LARECOMP_PAD_TYPE")) return input_pad_family();

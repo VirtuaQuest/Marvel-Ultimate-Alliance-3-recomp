@@ -471,8 +471,9 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     if (cap < 1.0) { ax *= cap; ay *= cap; }
     o->ax = ax; o->ay = ay;
     o->sx = ax * dyn; o->sy = ay * dyn; o->shape = shape;
-    // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
-    if (reshape) { o->vw = dw; o->vh = dh; }
+    // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box - or, with no reshape, stretched
+    // to the window (Video tab "Fill screen (stretch)": a 16:10 Steam Deck without bars, ~11% taller)
+    if (reshape || g_settings.aspect == ASPECT_STRETCH) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }
     if (wide_test > 0) {
         double f2 = fmin(dw / (1920.0 * wide_test), dh / 1080.0);

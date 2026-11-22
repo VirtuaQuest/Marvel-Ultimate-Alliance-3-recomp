@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MUA3 Recomp
+Comment=Open the Linux launcher and setup helper
+Exec=python3 -c "import os,sys; from urllib.parse import unquote,urlparse; p=urlparse(sys.argv[1]); f=unquote(p.path) if p.scheme=='file' else sys.argv[1]; os.execv('/bin/bash',['bash',os.path.join(os.path.dirname(os.path.abspath(f)),'run-linux.sh')])" %k
+Icon=applications-games
+Terminal=false
+Categories=Game;
+StartupNotify=false

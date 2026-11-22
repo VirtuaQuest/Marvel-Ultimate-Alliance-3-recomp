@@ -14,3 +14,6 @@ void pace_hitch(const char *why);
 // any thread: a user setting that changes the GPU's load ("resolution", "upscaler", "anti-aliasing"; not Dynamic's own
 // steps): the 30 fps hold and its backoff start over, and 60 gets a fresh try (pace.c)
 void pace_settings_changed(const char *what);
+// any thread: a movie's video decoder started (+1) or stopped (-1) (hle/movie.c); while one runs, frames are held to
+// 30 fps (pace.c)
+void pace_movie_active(int delta);

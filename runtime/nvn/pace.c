@@ -121,6 +121,38 @@ static void hold_cadence(bool held) {
     v_exit = __atomic_load_n(&g_vsync_count, __ATOMIC_ACQUIRE);
 }
 
+// Movies at 30 fps: from a video decoder's start to its stop (hle/movie.c pace_movie_active), each frame is held to
+// two vsyncs (hold_cadence) - a steady 33 ms instead of 60 fps frames that miss a vsync every few seconds (a Steam
+// Deck: two 4.5 ms effect passes left a movie frame ~2 ms of headroom). The decoder runs on its own clock, so the game
+// shows every other video frame. (The game takes video frames in bursts: a timeout after the last one flipped 30 / 60
+// every 0.3-1 s.) LARECOMP_MOVIE_30=0: off.
+static int movie_decoders;  // (__atomic builtins)
+void pace_movie_active(int delta) {
+    if (__atomic_add_fetch(&movie_decoders, delta, __ATOMIC_RELAXED) < 0) __atomic_store_n(&movie_decoders, 0, __ATOMIC_RELAXED);
+}
+static bool movie_30(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_MOVIE_30"); on = !e || !*e || atoi(e) != 0; }
+    bool m = on && __atomic_load_n(&movie_decoders, __ATOMIC_RELAXED) > 0;
+    static bool was;
+    if (m != was) { LOG("[pace] movie: %s\n", m ? "held to 30 fps while it plays" : "back to 60 fps"); was = m; }
+    return m;
+}
+
+// The movie hold's own cadence: the game sets its own present interval during a movie (60, 30, then 8.3 ms - 120 fps -
+// and the vsync count above follows it), so the hold waits by the clock instead: 33.3 ms from one frame's exit to the
+// next (a frame already later than that goes on at once and the cadence restarts from it).
+static void movie_cadence(void) {
+    static uint64_t next;
+    uint64_t t0 = plat_now_ns();
+    if (next && t0 < next) {
+        plat_sleep_until_ns(next);
+        g_blocked_ns += plat_now_ns() - t0;
+    }
+    uint64_t now = plat_now_ns();
+    next = next && now < next + 16666667ull ? next + 33333333ull : now + 33333333ull;
+}
+
 static float median60(const float *v) {
     float s[60];
     memcpy(s, v, sizeof s);
@@ -236,7 +268,7 @@ void pace_frame(void) {
             __atomic_store_n(&hitch_why, (const char *)why, __ATOMIC_RELAXED);
             __atomic_store_n(&hitch_at, now, __ATOMIC_RELEASE);
         }
-        hold_cadence(hold_30(pace_slow && on));
+        if (movie_30()) { hold_30(pace_slow && on); movie_cadence(); } else hold_cadence(hold_30(pace_slow && on));
         return;
     }
     double busy = (p > wt ? p - wt : 0) / 1e6;
@@ -296,7 +328,7 @@ void pace_frame(void) {
         if (ha != grace_of) grace_of = ha, ign_n = 0, ign_why = __atomic_load_n(&hitch_why, __ATOMIC_RELAXED);
         ign_n++, ign_busy += b, ign_late += late && !b;
         if (!on) return;
-        hold_cadence(hold_30(pace_slow));
+        if (movie_30()) { hold_30(pace_slow); movie_cadence(); } else hold_cadence(hold_30(pace_slow));
         return;
     }
     nover += o - (over[idx] & 1);
@@ -358,7 +390,7 @@ void pace_frame(void) {
             memset(recent, 0, sizeof recent);
         }
     }
-    hold_cadence(hold_30(pace_slow));
+    if (movie_30()) { hold_30(pace_slow); movie_cadence(); } else hold_cadence(hold_30(pace_slow));
 }
 
 uint64_t pace_end_counter(const uint64_t *start_entry, const uint64_t *entry, uint64_t value) {

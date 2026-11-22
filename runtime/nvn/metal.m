@@ -890,6 +890,7 @@ void backend_guest_memory_reset(void) {
 }
 
 // The window goes black while the game is down (instead of holding its last frame).
+void backend_loading_frame(int done, int total) { (void)done, (void)total; }  // (the title shows the progress)
 void backend_clear_window(void) {
     if (!layer || !dev || rq_stopping()) return;
     rq_drain();

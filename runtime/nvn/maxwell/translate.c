@@ -95,6 +95,8 @@ static void emit_recolour(Str *s, const char *c, const char *v3, const char *v4)
     sp(s, "    %s.rgb = mix(%s.rgb, rc_r, %s(rc_m));\n  }\n", c, c, v3);
 }
 
+typedef struct Construct Construct;  // (structure_flow)
+typedef struct VCtx VCtx;            // (expand_calls)
 typedef struct {
     const uint8_t *code;   // first instruction group
     size_t ninsts;         // number of 8-byte words to scan
@@ -122,6 +124,22 @@ typedef struct {
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
     bool img_read[64], img_write[64];  // image slots loaded from (SULD) / stored to (SUST)
+    int8_t *ssy_depth, *pbk_depth;     // (GLSL) static SSY / PBK stack depth before each instruction: static_stacks
+    int ssy_max, pbk_max;              // their deepest levels (slots ssy0.. / pbk0..); ssy_depth NULL: dynamic arrays
+    uint32_t *pop_tgt;                 // (static_stacks) where each SYNC / BRK goes; NULL: not known
+    bool structured;                   // (structure_flow) loops and blocks instead of the pc dispatcher
+    Construct *cons;                   // its constructs, in opening order
+    int ncons, nstack;
+    int *cons_at, *stack;              // construct + 1 by target ([2 l] block, [2 l + 1] loop); the open ones
+    const uint8_t *blob;               // the program and its constants (BRX tables)
+    size_t blob_size;
+    uint64_t *vcode;                   // (expand_calls) the program with its subroutines copied in; code points here
+    uint32_t *vorig;                   // its instructions' indices in the original program
+    uint16_t *vctx;                    // and their copies (vctxs: 0 the program itself)
+    VCtx *vctxs;
+    int nvctx;
+    const uint8_t *ocode;              // the original program
+    size_t oend;
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -666,7 +684,7 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     int type = t->type;
     bool cube = type == TEXTYPE_CUBE || type == TEXTYPE_CUBE_ARRAY;
     int n = (type == TEXTYPE_1D || type == TEXTYPE_1D_ARRAY) ? 1 : (type == TEXTYPE_2D || type == TEXTYPE_2D_ARRAY) ? 2 : 3;
-    if (c->stage != STAGE_FRAGMENT && lod_kind != 1) {
+    if (c->stage != STAGE_FRAGMENT && lod_kind != 1 && lod_kind != 3) {  // (3: explicit gradients, any stage)
         if (lod_kind == 0) lod = "0.0f";
         lod_kind = 1;
     }
@@ -707,6 +725,7 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     if (extra) snprintf(ex, sizeof ex, ", %s", extra);
     if (lod_kind == 0) snprintf(e, sizeof e, "texture(t%d, %s%s)", slot, P, ex);
     else if (lod_kind == 1) snprintf(e, sizeof e, "textureLod(t%d, %s%s, %s)", slot, P, ex, lod);
+    else if (lod_kind == 3) snprintf(e, sizeof e, "textureGrad(t%d, %s%s, %s)", slot, P, ex, lod);  // (lod: "dPdx, dPdy")
     else snprintf(e, sizeof e, "texture(t%d, %s%s, %s)", slot, P, ex, lod);
     if (t->shadow) sprintf(out, "vec4(%s)", e);
     else strcpy(out, e);
@@ -884,6 +903,43 @@ static void emit_tld4s(Ctx *c, uint64_t w) {
     if (dc) snprintf(call, sizeof call, "textureGather(t%d, %s, as_f(%s))", slot, P, dref);
     else snprintf(call, sizeof call, "textureGather(t%d, %s, %d)", slot, P, comp);
     write_tex_result(c, slot, call, 0xF, d0, d1, true, f16);
+}
+
+// TXD (GLSL): a lookup with explicit derivatives. Coordinates from gpr8, then (array or offsets) one register packing
+// the layer (low 16 bits) and the offsets (4-bit x at 16, y at 20); derivatives from gpr20, interleaved per
+// coordinate: dx.x, dy.x, dx.y, dy.y. 1D / 2D (and arrays) only.
+static void emit_txd(Ctx *c, uint64_t w) {
+    int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8), b = (int)bits(w, 20, 8), target = (int)bits(w, 29, 2);
+    bool array = bits(w, 28, 1), aoffi = bits(w, 35, 1);
+    uint32_t mask = (uint32_t)bits(w, 31, 4), index = (uint32_t)bits(w, 36, 13);
+    if (!c->glsl || target > 1) { fail(c, "txd %s", c->glsl ? "3d / cube" : "(msl)"); return; }
+    int n = target == 0 ? 1 : 2;
+    int type = target == 0 ? (array ? TEXTYPE_1D_ARRAY : TEXTYPE_1D) : (array ? TEXTYPE_2D_ARRAY : TEXTYPE_2D);
+    int slot = tex_slot(c, index, type, false, array);
+    char cs[2][40], lay[96], offv[96], grad[400];
+    const char *co[3] = {cs[0], cs[1], NULL}, *layp = NULL, *offp = NULL;
+    for (int i = 0; i < n; i++) { sprintf(cs[i], "as_type<float>(r%d)", a + i); c->reg_used[a + i] = 1; }
+    int pk = a + n;
+    if (array) { sprintf(lay, "min(r%d & 0xffffu, uint(tsize%d(0).z) - 1u)", pk, slot); c->reg_used[pk] = 1; layp = lay; }
+    if (aoffi) { sprintf(offv, "int2(int(r%d << 12) >> 28, int(r%d << 8) >> 28)", pk, pk); c->reg_used[pk] = 1; offp = offv; }
+    for (int i = 0; i < 2 * n; i++) c->reg_used[b + i] = 1;
+    if (n == 1) {
+        sprintf(grad, "as_type<float>(r%d), as_type<float>(r%d)", b, b + 1);
+    } else {
+        // (resolution-scaled textures: the coordinates go through uvs(), the derivatives scale with them)
+        const char *sc = c->stage != STAGE_VERTEX ? "rscale" : NULL;
+        if (sc) {
+            sprintf(grad, "vec2(as_type<float>(r%d), as_type<float>(r%d)) * rscale[%d].zw, "
+                          "vec2(as_type<float>(r%d), as_type<float>(r%d)) * rscale[%d].zw", b, b + 2, slot + 1, b + 1, b + 3, slot + 1);
+            c->uses_rscale = true;
+        } else {
+            sprintf(grad, "vec2(as_type<float>(r%d), as_type<float>(r%d)), vec2(as_type<float>(r%d), as_type<float>(r%d))",
+                    b, b + 2, b + 1, b + 3);
+        }
+    }
+    char call[4096];
+    glsl_sample(c, call, slot, co, layp, NULL, 3, grad, offp);
+    write_tex_result(c, slot, call, mask, d, RZ, false, false);
 }
 
 // TEX (full form): coordinates from consecutive registers at gpr8, extra parameters at gpr20.
@@ -1101,6 +1157,13 @@ static size_t cal_inline_ret(const Ctx *c, uint32_t target) {
     return 0;
 }
 
+static void structure_goto(Ctx *c, size_t from, size_t l);
+static void structure_exit(Ctx *c);
+static size_t vmap(const Ctx *c, int ctx, size_t k);
+static bool brx_marks(Ctx *c, size_t i, uint8_t *mark);
+static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const uint8_t *blob, size_t const_offset,
+                             uint8_t *label, bool clamped);
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
@@ -1121,7 +1184,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
     if (OPM(0xe300000000000000ull, 0xfff0000000000000ull)) {  // EXIT
-        sp(&c->body, c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
+        if (c->structured) structure_exit(c);
+        else sp(&c->body, c->branchy ? "    exit_now = true; break;\n" : "    break;\n");
     } else if (OPM(0xe330000000000000ull, 0xfff0000000000000ull)) {  // KIL
         c->info->uses_discard = true;
         if (getenv("LARECOMP_NO_DISCARD")) {
@@ -1131,10 +1195,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     } else if (OPM(0xe240000000000000ull, 0xfff0000000000020ull)) {  // BRA
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         c->uses_branches = true;
-        sp(&c->body, "    pc = %uu; continue;\n", target);
+        if (c->structured) structure_goto(c, pc / 8, target / 8);
+        else sp(&c->body, "    pc = %uu; continue;\n", target);
     } else if (OPM(0xe290000000000000ull, 0xfff0000000000020ull)) {  // SSY
         c->uses_branches = true;
-        sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (c->structured) {
+        } else if (!c->ssy_depth) sp(&c->body, "    ssy[ssy_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        else if (c->ssy_depth[pc / 8] >= 0)
+            sp(&c->body, "    ssy%d = %uu;\n", c->ssy_depth[pc / 8], norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe260000000000000ull, 0xfff0000000000020ull)) {  // CAL: a subroutine (its RET comes back here)
         uint32_t target = norm_target((int64_t)pc + 8 + sbits(w, 20, 24));
         size_t ret = cal_inline_ret(c, target);
@@ -1146,17 +1214,27 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             sp(&c->body, "    cst[cst_n++] = %uu; pc = %uu; continue;\n", norm_target((int64_t)pc + 8), target);
         }
     } else if (OPM(0xe320000000000000ull, 0xfff0000000000000ull)) {  // RET (from the program itself: EXIT)
-        sp(&c->body, c->branchy ? "    if (cst_n == 0u) { exit_now = true; break; } pc = cst[--cst_n]; continue;\n" : "    break;\n");
+        if (c->structured) structure_exit(c);  // (structure_flow: no CAL that isn't inlined)
+        else sp(&c->body, c->branchy ? "    if (cst_n == 0u) { exit_now = true; break; } pc = cst[--cst_n]; continue;\n" : "    break;\n");
     } else if (OPM(0xe2a0000000000000ull, 0xfff0000000000020ull)) {  // PBK
         c->uses_branches = true;
-        sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        if (c->structured) {
+        } else if (!c->pbk_depth) sp(&c->body, "    pbk[pbk_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
+        else if (c->pbk_depth[pc / 8] >= 0)
+            sp(&c->body, "    pbk%d = %uu;\n", c->pbk_depth[pc / 8], norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xe2b0000000000000ull, 0xfff0000000000020ull)) {  // PCNT
         c->uses_branches = true;
         sp(&c->body, "    pcnt[pcnt_n++] = %uu;\n", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+        if (c->structured) structure_goto(c, pc / 8, c->pop_tgt[pc / 8] / 8);
+        else if (!c->ssy_depth) sp(&c->body, "    pc = ssy[--ssy_n]; continue;\n");
+        else if (c->ssy_depth[pc / 8] > 0) sp(&c->body, "    pc = ssy%d; continue;\n", c->ssy_depth[pc / 8] - 1);
+        else sp(&c->body, "    exit_now = true; break;\n");  // (never reached: static_stacks)
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
+        if (c->structured) structure_goto(c, pc / 8, c->pop_tgt[pc / 8] / 8);
+        else if (!c->pbk_depth) sp(&c->body, "    pc = pbk[--pbk_n]; continue;\n");
+        else if (c->pbk_depth[pc / 8] > 0) sp(&c->body, "    pc = pbk%d; continue;\n", c->pbk_depth[pc / 8] - 1);
+        else sp(&c->body, "    exit_now = true; break;\n");  // (never reached: static_stacks)
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
         sp(&c->body, "    pc = pcnt[pcnt_n - 1]; continue;\n");
     } else if (OPM(0xf0f0000000000000ull, 0xfff8000000000000ull) || OPM(0x50b0000000000000ull, 0xfff8000000000000ull) ||
@@ -1213,6 +1291,8 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         emit_tex(c, w, false);
     } else if (OPM(0xdeb8000000000000ull, 0xfff8000000000000ull)) {  // TEX.B (bindless)
         emit_tex(c, w, true);
+    } else if (OPM(0xde38000000000000ull, 0xfff8000000000000ull)) {  // TXD
+        emit_txd(c, w);
     } else if (OPM(0xeb18000000000000ull, 0xfff8000000000000ull)) {  // SULD
         emit_surface(c, w, false);
     } else if (OPM(0xeb28000000000000ull, 0xfff8000000000000ull)) {  // SUST
@@ -1943,14 +2023,14 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         char e[256];
         const char *bv = R(b);
         if (op == 3 || op == 4) {  // INC / DEC wrap at b: a compare-and-swap loop
-            sp(&c->body, "    { uint ai = min(%s, %du), bv = %s, o = smem[ai], n;\n"
+            sp(&c->body, "    { uint ai = min(%s, smem_words_ - 1u), bv = %s, o = smem[ai], n;\n"
                          "      for (;;) { n = %s; uint p = atomicCompSwap(smem[ai], o, n); if (p == o) break; o = p; }\n",
-               ix, SMEM_WORDS - 1, bv, op == 3 ? "o >= bv ? 0u : o + 1u" : "(o == 0u || o > bv) ? bv : o - 1u");
+               ix, bv, op == 3 ? "o >= bv ? 0u : o + 1u" : "(o == 0u || o > bv) ? bv : o - 1u");
             if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = o;\n", d); }
             sp(&c->body, "    }\n");
         } else {
             if (size == 1 && (op == 1 || op == 2)) fail(c, "ATOMS signed min/max");  // (smem is uint: not seen yet)
-            sprintf(e, "%s(smem[min(%s, %du)], %s)", fn[op], ix, SMEM_WORDS - 1, bv);
+            sprintf(e, "%s(smem[min(%s, smem_words_ - 1u)], %s)", fn[op], ix, bv);
             if (d != RZ) set_reg(c, d, e);
             else sp(&c->body, "    %s;\n", e);
         }
@@ -1965,7 +2045,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         else c->uses_local = true;
         const char *mem = shared ? "smem" : "lmem";
         char ixf[64];  // word index wrapper: local memory masks (power of two), shared memory clamps
-        if (shared) sprintf(ixf, "min(%%s, %du)", SMEM_WORDS - 1);
+        if (shared) strcpy(ixf, "min(%s, smem_words_ - 1u)");
         else sprintf(ixf, "(%%s) & %du", LMEM_WORDS - 1);
         char addr[128];
         if (a == RZ) sprintf(addr, "%du", off);
@@ -2070,8 +2150,28 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     p2r_done:;
     } else if (OPM(0xe250000000000000ull, 0xfff0000000000020ull)) {  // BRX reg + imm (relative)
         // computed targets can name a scheduling word; execution continues at the next slot (as for BRA)
-        sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
-           (uint32_t)sbits(w, 20, 24));
+        if (c->structured) {  // (each target of the table: structure_flow; any other: the end, as the dispatcher's default)
+            size_t vi = pc / 8;  // (expand_calls: the table and the targets in the original program, mapped)
+            uint32_t opc = c->vorig ? c->vorig[vi] * 8 : pc;
+            const uint8_t *oc = c->vorig ? c->ocode : c->code;
+            size_t on = c->vorig ? c->oend : c->ninsts;
+            sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u;\n", opc + 8, R(a),
+               (uint32_t)sbits(w, 20, 24));
+            uint8_t *mark = calloc(on + 4, 1);
+            if (mark && brx_table_labels(oc, opc / 8, on, c->blob, c->blob_size, mark, true))
+                for (size_t k = 0; k < on; k++)
+                    if (mark[k]) {
+                        size_t nk = c->vorig ? vmap(c, c->vctx[vi], k) : k;
+                        sp(&c->body, "    if (t == %zuu) {\n", k * 8);
+                        structure_goto(c, vi, nk == SIZE_MAX ? c->ninsts : nk);
+                        sp(&c->body, "    }\n");
+                    }
+            free(mark);
+            structure_exit(c);
+            sp(&c->body, "    }\n");
+        } else
+            sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
+               (uint32_t)sbits(w, 20, 24));
     } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
         int test = (int)bits(w, 8, 5);
         const char *cond;
@@ -2644,7 +2744,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (glsl_early_tests(c)) sp(&s, "layout(early_fragment_tests) in;\n");
     } else {
         sp(&s, "layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
-        if (c->uses_shared) sp(&s, "shared uint smem[%d];\n", SMEM_WORDS);  // (LDS / STS)
+        // The pipeline specializes this to the NVN control section's allocation. Reserving 48 KB for every
+        // shader, including those with a few counters, unnecessarily limits resident workgroups on AMD APUs.
+        // Unknown/old records retain the original 48 KB default. The same constant bounds LDS/STS/ATOMS.
+        if (c->uses_shared)
+            sp(&s, "layout(constant_id = 3) const uint smem_words_ = %du;\nshared uint smem[smem_words_];\n", SMEM_WORDS);
     }
     sp(&s, "void main() {\n");
     if (stage == STAGE_VERTEX) {
@@ -2660,8 +2764,17 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
-    if (any_branch) {
-        sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
+    if (c->structured) {  // (structure_flow; pc / exit_now: unused)
+        sp(&s, "  uint pc = 8u; bool exit_now = false; uint jmp_ = 0u; uint guard_ = 0u;\n");
+        sp(&s, "  do {\n%s  } while (false);\n", body.buf ? body.buf : "");
+    } else if (any_branch) {
+        if (c->ssy_max < 0) {
+            sp(&s, "  uint pc = 8u; uint ssy[16]; uint ssy_n = 0u; uint pbk[16]; uint pbk_n = 0u; uint pcnt[16]; uint pcnt_n = 0u;\n");
+        } else {  // (static_stacks: a slot per level)
+            sp(&s, "  uint pc = 8u; uint pcnt[16]; uint pcnt_n = 0u;\n");
+            for (int i = 0; i < c->ssy_max; i++) sp(&s, "  uint ssy%d = 0u;\n", i);
+            for (int i = 0; i < c->pbk_max; i++) sp(&s, "  uint pbk%d = 0u;\n", i);
+        }
         sp(&s, "  uint cst[16]; uint cst_n = 0u;\n");
         sp(&s, "  bool exit_now = false;\n");
         sp(&s, "  for (uint guard = 0u; guard < 100000u; guard++) {\n");
@@ -2717,6 +2830,30 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
+// The table index's bound: the compiler clamps it (IMNMX Rx, Rx, K, maybe shifted in place) before the LDC at ldc.
+// Returns the number of entries, K + 1, or 256 when no clamp is found. (static_stacks: the words after a table that
+// still look like entries would add targets reached at other stack depths.)
+static int brx_table_entries(const uint64_t *code, size_t ldc) {
+    int rx = (int)bits(code[ldc], 8, 8);
+    if (rx == RZ) return 256;
+    for (size_t k = ldc, seen = 0; k-- > 0 && seen < 8;) {
+        if (k % 4 == 0) continue;
+        seen++;
+        uint64_t w = code[k];
+        if ((w & 0xfff0000000000000ull) >= 0xe200000000000000ull && (w & 0xfff0000000000000ull) <= 0xe350000000000000ull)
+            return 256;
+        if ((int)bits(w, 0, 8) != rx) continue;
+        if ((w & 0xfef8000000000000ull) == 0x3848000000000000ull && (int)bits(w, 8, 8) == rx) continue;  // SHL rx, rx, imm
+        if ((w & 0xfef8000000000000ull) == 0x3820000000000000ull && (int)bits(w, 8, 8) == rx &&  // IMNMX rx, rx, imm: min
+            bits(w, 39, 3) == PT && !bits(w, 42, 1) && !bits(w, 56, 1)) {
+            uint32_t v = (uint32_t)bits(w, 20, 19);
+            return v < 256 ? (int)v + 1 : 256;
+        }
+        return 256;  // (something else writes rx)
+    }
+    return 256;
+}
+
 // BRX (indirect branch, Vulkan / GLSL only): label just the targets its jump table can name. A BRX used to make every
 // instruction a case of the dispatcher switch (any one may be a target): hundreds of cases falling into each other
 // inside the dispatcher loop. Suspected of what AMD's Windows driver never finishes building (issue #237: the dialogue
@@ -2726,7 +2863,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 // are read until one isn't an instruction of this shader (the end of the table; a word past it that still looks like
 // one only adds a harmless case). False: not that shape (the register set some other way, no constants, nothing
 // valid) - the caller labels every instruction as before. LARECOMP_BRX_ALL_LABELS=1: always every instruction.
-static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const uint8_t *blob, size_t const_offset, uint8_t *label) {
+// clamped (static_stacks): only the entries the index can reach (brx_table_entries), all of them targets.
+static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const uint8_t *blob, size_t const_offset,
+                             uint8_t *label, bool clamped) {
     static int all = -1;
     if (all < 0) { const char *e = getenv("LARECOMP_BRX_ALL_LABELS"); all = e && atoi(e) != 0; }
     if (all || const_offset == 0x10000 || const_offset < 0x80) return false;  // (0x10000: no constants known; a program
@@ -2737,6 +2876,7 @@ static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const ui
     if (ra == RZ) return false;
     // the instruction that set ra: an LDC from cb1 within the few before, nothing else writing ra (or a branch) between
     int64_t table = -1;
+    int entries = 256;
     for (size_t k = i, seen = 0; k-- > 0 && seen < 32;) {
         if (k % 4 == 0) continue;  // (scheduling words)
         seen++;
@@ -2746,6 +2886,7 @@ static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const ui
         if ((w & 0xfff8000000000000ull) == 0xef90000000000000ull && (int)bits(w, 0, 8) == ra) {  // LDC ra, c[idx][Rx + off]
             if (bits(w, 36, 5) != 1 || bits(w, 48, 3) != 4) return false;  // (cb1, 32-bit)
             table = (int64_t)bits(w, 20, 16);
+            if (clamped) entries = brx_table_entries((const uint64_t *)code, k);
             break;
         }
         if ((int)bits(w, 0, 8) == ra) return false;  // (something else may write ra: unknown)
@@ -2754,7 +2895,7 @@ static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const ui
     const uint8_t *tab = blob + const_offset + table;
     uint8_t *mark = calloc(end + 4, 1);
     int n = 0;
-    for (int k = 0; k < 256; k++) {
+    for (int k = 0; k < entries; k++) {
         int32_t v;
         memcpy(&v, tab + 4 * k, 4);
         int64_t t = (int64_t)i * 8 + 8 + v + imm;
@@ -2764,9 +2905,448 @@ static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const ui
         mark[t / 8] = 1;
         n++;
     }
+    if (clamped && entries < 256 && n != entries) n = 0;  // (a clamped table whose entries aren't all targets: unknown)
     if (n) for (size_t k = 0; k < end; k++) label[k] |= mark[k];
     free(mark);
     return n > 0;
+}
+
+// (GLSL) SSY / PBK stack depths known at translation time. The dispatcher's ssy[16] / pbk[16] arrays are indexed by a
+// run-time counter: drivers keep such arrays in registers as 16-way selects for every push and pop (RADV: the big
+// effect compute programs hit the 256-VGPR limit with thousands of spilled SGPRs, ~300 KB of code, minutes to build).
+// Maxwell's compiler nests SSY/SYNC and PBK/BRK statically, so each instruction sees one depth on every path: then a
+// push or pop names its slot (ssy0, ssy1, ...) directly. A BRX goes to its jump table's targets (brx_table_labels).
+// Any path with another depth, a BRX without a known table, JMX, a subroutine that isn't inlined, PCNT / CONT or a
+// stack deeper than 16 keeps the arrays. LARECOMP_STATIC_STACKS=0: off (the arrays always).
+static void static_stacks(Ctx *c, const uint64_t *code, size_t end, const uint8_t *blob, size_t max_size) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_STATIC_STACKS"); on = !e || !*e || atoi(e) != 0; }
+    if (!on || end < 2) return;
+    // A stack state is a node: the state before its push (np), the pushed target (nt) and the depth (nd); node 0 is
+    // the empty stack. Each instruction keeps the node its paths bring (sn: SSY, bn: PBK; -1: not reached).
+    enum { NODES_MAX = 4096 };
+    int32_t *sn = malloc(end * sizeof *sn), *bn = malloc(end * sizeof *bn), *np = malloc(NODES_MAX * sizeof *np);
+    uint32_t *nt = malloc(NODES_MAX * sizeof *nt), *work = malloc(end * sizeof *work);
+    int8_t *nd = malloc(NODES_MAX), *sd = malloc(end), *bd = malloc(end);
+    uint8_t *brx = NULL;  // (a BRX's targets)
+    int nn = 1;
+    bool mixed = false;  // (one depth on every path, but different targets: the slots work, structure_flow doesn't)
+    if (!sn || !bn || !np || !nt || !work || !nd || !sd || !bd) goto off;
+    for (size_t k = 0; k < end; k++) sn[k] = bn[k] = -1;
+    np[0] = -1; nt[0] = 0; nd[0] = 0;
+    size_t nw = 0;
+    int smax = 0, bmax = 0;
+#define SS_VISIT(j, s_, b_) do { size_t j_ = (j); int32_t s1_ = (s_), b1_ = (b_); \
+        if (j_ % 4 == 0) j_++; \
+        if (j_ >= end) break; \
+        if (sn[j_] < 0) { sn[j_] = s1_; bn[j_] = b1_; work[nw++] = (uint32_t)j_; } \
+        else if (sn[j_] != s1_ || bn[j_] != b1_) { \
+            if (nd[sn[j_]] != nd[s1_] || nd[bn[j_]] != nd[b1_]) goto off; \
+            mixed = true; } } while (0)
+#define SS_PUSH(n_, t_, out_) do { int32_t m_ = -1; \
+        for (int q_ = 1; q_ < nn; q_++) if (np[q_] == (n_) && nt[q_] == (t_)) { m_ = q_; break; } \
+        if (m_ < 0) { \
+            if (nn >= NODES_MAX || nd[n_] >= 16) goto off; \
+            m_ = nn++; np[m_] = (n_); nt[m_] = (t_); nd[m_] = (int8_t)(nd[n_] + 1); } \
+        (out_) = m_; } while (0)
+    SS_VISIT(1, 0, 0);
+    while (nw) {
+        size_t i = work[--nw];
+        uint64_t w = code[i], top12 = w & 0xfff0000000000000ull;
+        int32_t s = sn[i], b = bn[i], s2, b2;
+        if (nd[s] > smax) smax = nd[s];
+        if (nd[b] > bmax) bmax = nd[b];
+        int pr = (int)bits(w, 16, 3);
+        bool prn = bits(w, 19, 1);
+        bool flow_push = top12 == 0xe290000000000000ull || top12 == 0xe2a0000000000000ull || top12 == 0xe2b0000000000000ull ||
+                         top12 == 0xe270000000000000ull;
+        if (flow_push) pr = PT, prn = false;
+        bool never = pr == PT && prn, always = pr == PT && !prn;
+        size_t next = i + 1;
+        if (never) { SS_VISIT(next, s, b); continue; }
+        int64_t t = norm_target((int64_t)i * 8 + 8 + sbits(w, 20, 24));
+        size_t ti = t >= 0 && (size_t)(t / 8) < end ? (size_t)(t / 8) : end;
+        if (top12 == 0xe300000000000000ull || top12 == 0xe320000000000000ull) {  // EXIT / RET (no CAL: the end)
+            if (!always) SS_VISIT(next, s, b);
+        } else if (top12 == 0xe240000000000000ull) {  // BRA
+            if (w & 0x20) goto off;
+            if (ti < end) SS_VISIT(ti, s, b);
+            if (!always) SS_VISIT(next, s, b);
+        } else if (top12 == 0xe290000000000000ull) {  // SSY
+            if (w & 0x20) goto off;
+            if (ti < end) SS_VISIT(ti, s, b);  // (where its SYNC goes: the stack as before the push)
+            SS_PUSH(s, (uint32_t)t, s2);
+            SS_VISIT(next, s2, b);
+        } else if (top12 == 0xe2a0000000000000ull) {  // PBK
+            if (w & 0x20) goto off;
+            if (ti < end) SS_VISIT(ti, s, b);
+            SS_PUSH(b, (uint32_t)t, b2);
+            SS_VISIT(next, s, b2);
+        } else if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull) {  // SYNC: on to the SSY's target
+            if (s == 0) goto off;
+            if (!always) SS_VISIT(next, s, b);
+        } else if (top12 == 0xe340000000000000ull) {  // BRK
+            if (b == 0) goto off;
+            if (!always) SS_VISIT(next, s, b);
+        } else if (top12 == 0xe250000000000000ull) {  // BRX: the jump table's targets (others: the dispatcher's exit)
+            if (w & 0x20) goto off;
+            if (!brx && !(brx = malloc(end + 4))) goto off;
+            memset(brx, 0, end + 4);
+            if (!brx_marks(c, i, brx)) goto off;
+            for (size_t k = 0; k < end; k++)
+                if (brx[k]) SS_VISIT(k, s, b);
+            if (!always) SS_VISIT(next, s, b);
+        } else if (top12 == 0xe260000000000000ull) {  // CAL: only subroutines inlined (no flow of their own)
+            if ((w & 0x20) || !cal_inline_ret(c, (uint32_t)t)) goto off;
+            SS_VISIT(next, s, b);
+        } else if ((w >> 56) == 0xe2 || top12 == 0xe310000000000000ull || top12 == 0xe350000000000000ull) {
+            goto off;  // BRX, JMX / JMP / JCAL, PCNT / CONT, PRET, PLONGJMP / LONGJMP: not followed
+        } else {
+            SS_VISIT(next, s, b);
+        }
+    }
+#undef SS_VISIT
+#undef SS_PUSH
+    for (size_t k = 0; k < end; k++) {
+        sd[k] = sn[k] < 0 ? -1 : nd[sn[k]];
+        bd[k] = bn[k] < 0 ? -1 : nd[bn[k]];
+    }
+    if (!mixed && (c->pop_tgt = malloc(end * sizeof *c->pop_tgt))) {
+        for (size_t k = 0; k < end; k++) {  // (SYNC / BRK: where they go)
+            uint64_t w = code[k];
+            c->pop_tgt[k] = UINT32_MAX;
+            if (k % 4 == 0 || sn[k] < 0) continue;
+            if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull) c->pop_tgt[k] = nt[sn[k]];
+            else if ((w & 0xfff0000000000000ull) == 0xe340000000000000ull) c->pop_tgt[k] = nt[bn[k]];
+        }
+    }
+    free(sn); free(bn); free(np); free(nt); free(work); free(nd); free(brx);
+    c->ssy_depth = sd; c->pbk_depth = bd;
+    c->ssy_max = smax; c->pbk_max = bmax;
+    return;
+off:
+    free(sn); free(bn); free(np); free(nt); free(work); free(nd); free(sd); free(bd); free(brx);
+}
+
+// (structure_flow) Subroutines with flow of their own (CALs cal_inline_ret doesn't inline) keep a return stack and
+// with it the pc dispatcher (cs 72b45dd400: 8 subroutines, 2.3 MB of GLSL, a Steam Deck lockup). expand_calls lays the
+// program out again with a copy of each such subroutine in place of every call: the CAL becomes a BRA past the copy
+// with the CAL's predicate inverted (emit_insn has always guarded a CAL with its predicate bits), each RET in the copy
+// a BRA past it. Instructions are packed three to a group of four (index % 4 == 0: an empty scheduling word) and every
+// relative target is rewritten for the new layout; a BRX keeps its original pc and table (brx_marks, emit_insn map its
+// targets through vmap). NULL: nothing to expand, or a subroutine that can't be copied (a branch out of it, calls
+// nested too deep, too big a result).
+struct VCtx { size_t t, r; int32_t *map; };  // a copy of the instructions t..r (context 0: the whole program)
+
+static size_t vmap(const Ctx *c, int ctx, size_t k) {
+    const VCtx *x = &c->vctxs[ctx];
+    if (k < x->t || k > x->r || x->map[k - x->t] < 0) return SIZE_MAX;
+    return (size_t)x->map[k - x->t];
+}
+
+static size_t vidx(size_t e) { return e / 3 * 4 + e % 3 + 1; }  // entry -> index (three instructions per group)
+
+// the subroutine at t: up to the unconditional RET past every branch target inside it; 0: not one that can be copied
+static size_t sub_end(const uint64_t *code, size_t end, size_t t) {
+    size_t reach = t;
+    for (size_t k = t; k < end; k++) {
+        if (k % 4 == 0) continue;
+        uint64_t x = code[k], top12 = x & 0xfff0000000000000ull;
+        if (top12 == 0xe240000000000000ull || top12 == 0xe290000000000000ull || top12 == 0xe2a0000000000000ull) {
+            size_t bt = norm_target((int64_t)k * 8 + 8 + sbits(x, 20, 24)) / 8;
+            if (bt < t) return 0;  // (out of the subroutine, backwards)
+            if (bt > reach) reach = bt;
+        } else if ((x >> 56) == 0xe2 && top12 != 0xe250000000000000ull && top12 != 0xe260000000000000ull) {
+            return 0;  // (JMX / JMP / JCAL, PRET, PLONGJMP, PCNT)
+        } else if (top12 == 0xe310000000000000ull || top12 == 0xe350000000000000ull) {
+            return 0;  // (LONGJMP, CONT)
+        }
+        if (top12 == 0xe320000000000000ull && bits(x, 16, 4) == PT && k >= reach) return k;
+    }
+    return 0;
+}
+
+typedef struct { uint64_t w; uint32_t orig; uint16_t ctx; uint8_t kind; uint32_t fix; } VEnt;  // kind 1: BRA to entry fix
+typedef struct { const uint64_t *code; size_t end; VEnt *e; size_t n, cap; VCtx *x; int nx, capx; bool bad; } VLay;
+
+static void vlay_put(VLay *l, VEnt v) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 4096;
+        if (l->cap > 196608) { l->bad = true; return; }
+        VEnt *e = realloc(l->e, l->cap * sizeof *e);
+        if (!e) { l->bad = true; return; }
+        l->e = e;
+    }
+    l->e[l->n++] = v;
+}
+
+static void vlay_region(Ctx *c, VLay *l, size_t t, size_t r, int depth) {
+    if (l->nx == l->capx) {
+        l->capx = l->capx ? l->capx * 2 : 64;
+        VCtx *x = realloc(l->x, l->capx * sizeof *x);
+        if (!x) { l->bad = true; return; }
+        l->x = x;
+    }
+    int ctx = l->nx++;
+    l->x[ctx] = (VCtx){.t = t, .r = r, .map = malloc((r - t + 1) * sizeof(int32_t))};
+    if (!l->x[ctx].map || ctx > 65535) { l->bad = true; return; }
+    for (size_t k = t; k <= r; k++) l->x[ctx].map[k - t] = -1;
+    size_t first_ret_fix = l->n;  // (this region's RETs, fixed up below: past the copy)
+    for (size_t k = t; k <= r && !l->bad; k++) {
+        if (k % 4 == 0) continue;
+        uint64_t w = l->code[k];
+        l->x[ctx].map[k - t] = (int32_t)l->n;  // (the entry number for now; an index below)
+        if ((w & 0xfff0000000000020ull) == 0xe260000000000000ull) {  // CAL
+            size_t st = norm_target((int64_t)k * 8 + 8 + sbits(w, 20, 24)) / 8;
+            if (st >= l->end) { l->bad = true; return; }
+            if (!cal_inline_ret(c, (uint32_t)(st * 8))) {
+                size_t sr = sub_end(l->code, l->end, st);
+                if (!sr || depth >= 8) { l->bad = true; return; }
+                size_t at = l->n;
+                vlay_put(l, (VEnt){.w = w ^ 0x80000ull, .orig = (uint32_t)k, .ctx = (uint16_t)ctx, .kind = 1});  // @!P BRA past
+                vlay_region(c, l, st, sr, depth + 1);
+                if (l->bad) return;
+                l->e[at].fix = (uint32_t)l->n;
+                continue;
+            }
+        }
+        if (ctx && (w & 0xfff0000000000000ull) == 0xe320000000000000ull)  // RET in a copy: BRA past it (fixed up below)
+            vlay_put(l, (VEnt){.w = w, .orig = (uint32_t)k, .ctx = (uint16_t)ctx, .kind = 2});
+        else
+            vlay_put(l, (VEnt){.w = w, .orig = (uint32_t)k, .ctx = (uint16_t)ctx});
+    }
+    if (ctx)
+        for (size_t e = first_ret_fix; e < l->n; e++)
+            if (l->e[e].kind == 2 && l->e[e].ctx == ctx) { l->e[e].kind = 1; l->e[e].fix = (uint32_t)l->n; }
+}
+
+static uint64_t with_target(uint64_t w, size_t at, size_t target) {
+    int64_t off = (int64_t)target * 8 - ((int64_t)at * 8 + 8);
+    return (w & ~(0xffffffull << 20)) | (((uint64_t)off & 0xffffffull) << 20);
+}
+
+static uint64_t *expand_calls(Ctx *c, const uint64_t *code, size_t end, size_t *vend) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_STRUCTURED"); on = !e || !*e || atoi(e) != 0; }
+    if (!on) return NULL;
+    bool any = false;
+    for (size_t k = 1; k < end && !any; k++)
+        if (k % 4 && (code[k] & 0xfff0000000000020ull) == 0xe260000000000000ull &&
+            !cal_inline_ret(c, norm_target((int64_t)k * 8 + 8 + sbits(code[k], 20, 24))))
+            any = true;
+    if (!any) return NULL;
+    VLay l = {.code = code, .end = end};
+    vlay_region(c, &l, 0, end - 1, 0);
+    uint64_t *v = NULL;
+    size_t n = l.n ? vidx(l.n - 1) + 1 : 0;
+    if (l.bad || !n || !(v = calloc(n, sizeof *v)) || !(c->vorig = calloc(n, sizeof *c->vorig)) ||
+        !(c->vctx = calloc(n, sizeof *c->vctx)))
+        goto fail;
+    for (int x = 0; x < l.nx; x++)  // (entry numbers -> indices)
+        for (size_t k = l.x[x].t; k <= l.x[x].r; k++)
+            if (l.x[x].map[k - l.x[x].t] >= 0) l.x[x].map[k - l.x[x].t] = (int32_t)vidx((size_t)l.x[x].map[k - l.x[x].t]);
+    c->vctxs = l.x; c->nvctx = l.nx;
+    for (size_t e = 0; e < l.n; e++) {
+        VEnt *x = &l.e[e];
+        size_t i = vidx(e);
+        uint64_t w = x->w, top12 = w & 0xfff0000000000000ull;
+        c->vorig[i] = x->orig; c->vctx[i] = x->ctx;
+        if (x->kind == 1) {  // (BRA past a copy, predicate bits kept)
+            w = with_target(0xe24000000000000full | (w & 0xf0000ull), i, x->fix < l.n ? vidx(x->fix) : n);
+        } else if (((top12 == 0xe240000000000000ull || top12 == 0xe290000000000000ull || top12 == 0xe2a0000000000000ull) &&
+                    !(w & 0x20)) || (top12 == 0xe260000000000000ull && !(w & 0x20))) {  // BRA / SSY / PBK / CAL (inlined)
+            size_t ot = norm_target((int64_t)x->orig * 8 + 8 + sbits(w, 20, 24)) / 8;
+            size_t nt = top12 == 0xe260000000000000ull ? vmap(c, 0, ot) : vmap(c, x->ctx, ot);
+            if (nt == SIZE_MAX) {
+                if (x->ctx || ot < end) goto fail;  // (out of a copy; into a gap)
+                nt = n;  // (past the end of the program: its end, as before)
+            }
+            w = with_target(w, i, nt);
+        }
+        v[i] = w;
+    }
+    free(l.e);
+    c->ocode = (const uint8_t *)code; c->oend = end;
+    *vend = n;
+    return v;
+fail:
+    for (int x = 0; x < l.nx; x++) free(l.x[x].map);
+    free(l.x); free(l.e); free(v); free(c->vorig); free(c->vctx);
+    c->vorig = NULL; c->vctx = NULL; c->vctxs = NULL; c->nvctx = 0;
+    return NULL;
+}
+
+static void expand_free(Ctx *c) {
+    for (int x = 0; x < c->nvctx; x++) free(c->vctxs[x].map);
+    free(c->vctxs); free(c->vorig); free(c->vctx); free(c->vcode);
+    c->vctxs = NULL; c->vorig = NULL; c->vctx = NULL; c->vcode = NULL; c->nvctx = 0;
+}
+
+// A BRX's targets as indices of the program being translated (expand_calls: through its original pc and vmap).
+static bool brx_marks(Ctx *c, size_t i, uint8_t *mark) {
+    if (!c->vorig) return brx_table_labels(c->code, i, c->ninsts, c->blob, c->blob_size, mark, true);
+    uint8_t *om = calloc(c->oend + 4, 1);
+    bool ok = om && brx_table_labels(c->ocode, c->vorig[i], c->oend, c->blob, c->blob_size, om, true);
+    for (size_t k = 0; ok && k < c->oend; k++)
+        if (om[k]) {
+            size_t nk = vmap(c, c->vctx[i], k);
+            if (nk == SIZE_MAX) ok = false;
+            else mark[nk] = 1;
+        }
+    free(om);
+    return ok;
+}
+
+// (GLSL compute) Structured control flow. The pc dispatcher (switch in a loop) makes every register a value carried
+// around the loop into every case: the driver keeps all of them live everywhere (the big effect compute programs:
+// 256 VGPRs, thousands of spills, still slow after static_stacks). With every SYNC / BRK target known (static_stacks:
+// one stack content on every path), each jump has a fixed target, and the program is straight-line code with gotos.
+// A forward goto to L becomes a break out of a do { } while (false) block that ends at L, a backward one a continue
+// of a for (;;) loop that starts at L. Blocks may start earlier and loops end later until all of them nest; a jump
+// into the middle of a loop doesn't, and keeps the dispatcher. A jump out of more than one construct sets jmp_ and
+// breaks; each construct's end passes it on (structure_close). LARECOMP_STRUCTURED=0: off.
+struct Construct { uint32_t start, stop; uint8_t loop, clear, cont, prop; };  // [start, stop) of the instructions
+
+static size_t next_insn(size_t i) { i++; return i % 4 == 0 ? i + 1 : i; }
+
+static void structure_flow(Ctx *c, const uint64_t *code, size_t end) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("LARECOMP_STRUCTURED"); on = !e || !*e || atoi(e) != 0; }
+    if (!on || !c->pop_tgt || !c->ssy_depth) return;  // (every stage: structure_exit ends a vertex / fragment one)
+    uint32_t stop_end = (uint32_t)end + 1;  // (constructs that last to the end of the program)
+    uint32_t *fwd = malloc((end + 2) * sizeof *fwd), *back = malloc((end + 2) * sizeof *back);
+    uint8_t *mark = malloc(end + 4);
+    Construct *cs = NULL;
+    int n = 0;
+    if (!fwd || !back || !mark) goto off;
+    for (size_t k = 0; k < end + 2; k++) fwd[k] = UINT32_MAX, back[k] = 0;
+    // the jumps: forward ones by target (the first source), backward ones by target (the last source + 1)
+#define SF_JUMP(src_, l_) do { size_t s_ = (src_), l1_ = (l_); \
+        if (l1_ % 4 == 0) l1_++; \
+        if (l1_ >= end) break; \
+        if (l1_ > s_) { if (s_ < fwd[l1_]) fwd[l1_] = (uint32_t)s_; } \
+        else { size_t e_ = next_insn(s_); if (e_ > back[l1_]) back[l1_] = (uint32_t)e_; } } while (0)
+    for (size_t i = 1; i < end; i++) {
+        if (i % 4 == 0 || c->ssy_depth[i] < 0) continue;
+        uint64_t w = code[i], top12 = w & 0xfff0000000000000ull;
+        int pr = (int)bits(w, 16, 3);
+        if (pr == PT && bits(w, 19, 1) && top12 != 0xe290000000000000ull && top12 != 0xe2a0000000000000ull) continue;
+        int64_t t = norm_target((int64_t)i * 8 + 8 + sbits(w, 20, 24));
+        if (top12 == 0xe240000000000000ull) {  // BRA
+            if (t >= 0) SF_JUMP(i, (size_t)(t / 8));
+        } else if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || top12 == 0xe340000000000000ull) {  // SYNC, BRK
+            if (c->pop_tgt[i] == UINT32_MAX) goto off;
+            SF_JUMP(i, c->pop_tgt[i] / 8);
+        } else if (top12 == 0xe250000000000000ull) {  // BRX
+            memset(mark, 0, end + 4);
+            if (!brx_marks(c, i, mark)) goto off;
+            for (size_t k = 0; k < end; k++)
+                if (mark[k]) SF_JUMP(i, k);
+        }
+    }
+#undef SF_JUMP
+    int cap = 0;
+    for (size_t l = 1; l < end; l++) cap += (fwd[l] != UINT32_MAX) + (back[l] != 0);
+    if (cap > 8192 || !(cs = calloc(cap ? cap : 1, sizeof *cs))) goto off;
+    for (size_t l = 1; l < end; l++) {
+        if (fwd[l] != UINT32_MAX) cs[n++] = (Construct){.start = fwd[l], .stop = (uint32_t)l};
+        if (back[l]) cs[n++] = (Construct){.start = (uint32_t)l, .stop = back[l] >= end ? stop_end : back[l], .loop = 1};
+    }
+    // nest: a block crossing another starts earlier (around it); a loop crossing a later one ends later
+    for (int pass = 0, changed = 1; changed; pass++) {
+        if (pass > 2000) goto off;
+        changed = 0;
+        for (int a = 0; a < n; a++)
+            for (int b = 0; b < n; b++) {
+                Construct *x = &cs[a], *y = &cs[b];
+                if (!(x->start < y->start && y->start < x->stop && x->stop < y->stop)) continue;  // (x opens first)
+                if (!y->loop) y->start = x->start;
+                else if (x->loop) x->stop = y->stop;
+                else goto off;  // (a block from before a loop to inside it: a jump into the loop)
+                changed = 1;
+            }
+    }
+    // opening order: by start, the outer (later stop) first, a loop around a block of the same span
+    for (int a = 1; a < n; a++) {
+        Construct t = cs[a];
+        int b = a - 1;
+        while (b >= 0 && (cs[b].start > t.start || (cs[b].start == t.start &&
+                          (cs[b].stop < t.stop || (cs[b].stop == t.stop && !cs[b].loop && t.loop))))) {
+            cs[b + 1] = cs[b];
+            b--;
+        }
+        cs[b + 1] = t;
+    }
+    // the nesting depth (and a check that equal spans or shared ends still nest)
+    int depth = 0, maxd = 0, *stk = malloc((n + 1) * sizeof *stk);
+    if (!stk) goto off;
+    for (int a = 0; a < n; a++) {
+        while (depth && cs[stk[depth - 1]].stop <= cs[a].start) depth--;
+        if (depth && cs[a].stop > cs[stk[depth - 1]].stop) { free(stk); goto off; }
+        stk[depth++] = a;
+        if (depth > maxd) maxd = depth;
+    }
+    free(stk);
+    if (maxd > 200) goto off;
+    c->cons_at = calloc(2 * (end + 2), sizeof *c->cons_at);  // [2 l]: the block ending at l, [2 l + 1]: the loop at l
+    c->stack = malloc((n + 1) * sizeof *c->stack);
+    if (!c->cons_at || !c->stack) { free(c->cons_at); free(c->stack); c->cons_at = NULL; c->stack = NULL; goto off; }
+    for (int a = 0; a < n; a++) {
+        if (cs[a].loop) c->cons_at[2 * cs[a].start + 1] = a + 1;
+        else c->cons_at[2 * cs[a].stop] = a + 1;
+    }
+    c->cons = cs; c->ncons = n; c->nstack = 0;
+    c->structured = true;
+    free(fwd); free(back); free(mark);
+    return;
+off:
+    free(fwd); free(back); free(mark); free(cs);
+}
+
+// (structure_flow) A jump from the current position to instruction l (>= end: the program's end).
+static void structure_goto(Ctx *c, size_t from, size_t l) {
+    if (l % 4 == 0) l++;
+    if (l >= c->ninsts) { structure_exit(c); return; }
+    int id = c->cons_at[2 * l + (l <= from)];
+    int k = c->nstack;
+    while (k-- > 0 && c->stack[k] != id - 1) {}
+    if (!id || k < 0) {  // (not around this jump: can't be, structure_flow nests them)
+        fprintf(stderr, "[shader] structured flow: no construct for a jump %zx -> %zx\n", from * 8, l * 8);
+        structure_exit(c);
+        return;
+    }
+    Construct *t = &c->cons[id - 1];
+    if (k == c->nstack - 1) { sp(&c->body, t->loop ? "    continue;\n" : "    break;\n"); return; }
+    for (int j = k + 1; j < c->nstack; j++) {
+        Construct *x = &c->cons[c->stack[j]];
+        if (j == k + 1 && t->loop) x->cont = 1;
+        else x->prop = 1;
+    }
+    if (!t->loop) t->clear = 1;
+    sp(&c->body, "    jmp_ = %du; break;\n", id);
+}
+
+// The program's end: a compute shader returns; a vertex / fragment one leaves every construct and the body's
+// do { } while (false), on to its outputs (glsl_finish): jmp_ set to a value no construct has, passed on by each.
+static void structure_exit(Ctx *c) {
+    if (c->stage == STAGE_COMPUTE) { sp(&c->body, "    return;\n"); return; }
+    if (!c->nstack) { sp(&c->body, "    break;\n"); return; }
+    for (int j = 0; j < c->nstack; j++) c->cons[c->stack[j]].prop = 1;
+    sp(&c->body, "    jmp_ = 0xffffffffu; break;\n");
+}
+
+static void structure_open(Ctx *c, int a) {
+    c->stack[c->nstack++] = a;
+    if (c->cons[a].loop) sp(&c->body, "  for (;;) {\n  if (++guard_ > 100000u) return;\n");
+    else sp(&c->body, "  do {\n");
+}
+
+static void structure_close(Ctx *c) {
+    Construct *x = &c->cons[c->stack[--c->nstack]];
+    sp(&c->body, x->loop ? "  break;\n  }\n" : "  } while (false);\n");
+    if (x->clear) sp(&c->body, "  if (jmp_ == %du) jmp_ = 0u;\n", (int)(x - c->cons) + 1);
+    if (x->cont) sp(&c->body, "  if (jmp_ == %du) { jmp_ = 0u; continue; }\n", c->stack[c->nstack - 1] + 1);
+    if (x->prop) sp(&c->body, "  if (jmp_ != 0u) break;\n");
 }
 
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
@@ -2825,7 +3405,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         }
         if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: its jump table's targets, else any instruction
             any_branch = true;
-            if (!c->glsl || !brx_table_labels(code, i, end, blob, max_size, label)) memset(label, 1, end);
+            if (!c->glsl || !brx_table_labels(code, i, end, blob, max_size, label, false)) memset(label, 1, end);
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
             (w & 0xfff0000000000000ull) == 0xe350000000000000ull)
@@ -2837,7 +3417,40 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     static int annotate = -1;
     if (annotate < 0) annotate = getenv("LARECOMP_SAVE_MSL") != NULL;
     c->branchy = any_branch;
-    for (size_t i = 0; i < end && (!c->fail || survey_on()); i++) {
+    c->blob = blob; c->blob_size = max_size;
+    const uint64_t *sc = (const uint64_t *)code;  // (structure_flow: the program, its subroutines copied in: expand_calls)
+    size_t send = end;
+    if (c->glsl && any_branch && stage == STAGE_COMPUTE && (c->vcode = expand_calls(c, sc, end, &send))) {
+        sc = c->vcode;
+        c->code = (const uint8_t *)sc; c->ninsts = send;
+        static_stacks(c, sc, send, blob, max_size);
+        structure_flow(c, sc, send);
+        if (!c->structured) {  // (back to the program as it is, for the dispatcher)
+            free(c->ssy_depth); free(c->pbk_depth); free(c->pop_tgt);
+            c->ssy_depth = c->pbk_depth = NULL; c->pop_tgt = NULL;
+            expand_free(c);
+            sc = (const uint64_t *)code; send = end;
+            c->code = code; c->ninsts = end;
+        }
+    }
+    if (c->glsl && any_branch && !c->structured) static_stacks(c, (const uint64_t *)code, end, blob, max_size);
+    if (c->glsl && any_branch && !c->structured) structure_flow(c, (const uint64_t *)code, end);
+    if (c->structured) {  // (structure_flow: the instructions in order, the constructs around them; unreached ones left out)
+        for (size_t i = 1, oi = 0; i < send && (!c->fail || survey_on()); i++) {
+            if (i % 4 == 0) continue;
+            while (c->nstack && c->cons[c->stack[c->nstack - 1]].stop == i) structure_close(c);
+            while (oi < (size_t)c->ncons && c->cons[oi].start == i) structure_open(c, (int)oi++);
+            uint32_t pc = (uint32_t)(i * 8);
+            if (c->ssy_depth[i] >= 0) {
+                if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)sc[i]);
+                emit_insn(c, sc[i], pc);
+                light_tiles_fix(c, sc, send, pc);
+            }
+            if (i < end) info->num_insts++;
+        }
+        while (c->nstack) structure_close(c);
+    }
+    for (size_t i = 0; i < end && !c->structured && (!c->fail || survey_on()); i++) {
         if (i % 4 == 0) continue;
         uint32_t pc = (uint32_t)(i * 8);
         if (any_branch && label[i]) sp(&c->body, "  case %uu:\n", pc);
@@ -2853,6 +3466,22 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         info->num_insts++;
     }
     free(label);
+    bool static_slots = c->ssy_depth != NULL;  // (glsl_finish declares the slots: ssy_max / pbk_max)
+    free(c->ssy_depth); free(c->pbk_depth); free(c->pop_tgt); free(c->cons); free(c->cons_at); free(c->stack);
+    c->ssy_depth = c->pbk_depth = NULL; c->pop_tgt = NULL; c->cons = NULL; c->cons_at = c->stack = NULL;
+    expand_free(c);
+    c->code = code; c->ninsts = end;
+    // A compute program left as a big pc dispatcher can take the driver minutes to build and the GPU long enough to hang
+    // the device (cs 72b45dd400 before expand_calls: 2.3 MB, a Steam Deck lockup). Such a program fails here: its
+    // dispatches are skipped. LARECOMP_MAX_DISPATCHER_KB (default 1600; 0: no limit).
+    if (c->glsl && stage == STAGE_COMPUTE && any_branch && !c->structured && !c->fail) {
+        static long max_kb = -1;
+        if (max_kb < 0) { const char *e = getenv("LARECOMP_MAX_DISPATCHER_KB"); max_kb = e && *e ? atol(e) : 1600; }
+        if (max_kb > 0 && c->body.len > (size_t)max_kb * 1024)
+            fail(c, "compute dispatcher too large (%zu KB, LARECOMP_MAX_DISPATCHER_KB=%ld)", c->body.len / 1024, max_kb);
+    }
+    c->ssy_max = static_slots ? c->ssy_max + 1 : -1;  // (slots to declare; -1: the arrays)
+    c->pbk_max = static_slots ? c->pbk_max + 1 : -1;
     // (MSL: more textures than sampler slots take a slot table, at a buffer index the vertex stage's streams use)
     if (!c->glsl && stage == STAGE_VERTEX && info->ntex > MSL_MAX_SAMPLERS)
         fail(c, "%d textures in a vertex shader (Metal: %d samplers)", info->ntex, MSL_MAX_SAMPLERS);

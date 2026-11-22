@@ -3,6 +3,10 @@ extracted/
 generated/
 *.log
 .venv/
+.venv-linux/
+.venv-bootstrap/
+.python/
+.uv-cache/
 build/
 save/
 save.route-backup/
